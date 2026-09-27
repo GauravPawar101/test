@@ -1,0 +1,243 @@
+name: decision-engine-verify
+
+# CI harness for https://github.com/GauravPawar101/decision-engine
+#
+# This repo carries no source of its own. Every job checks the engine out at a given ref into
+# `decision-engine/` and runs the project's own checks there, so the engine repo stays free of
+# throwaway CI and any ref (branch, tag, PR head) can be verified from here:
+#
+#   gh workflow run decision-engine-verify -f ref=fix/rule-based-gateway-score
+#   ./run.sh fix/rule-based-gateway-score          # same thing, and prints the run URL
+#
+# Everything used here is free on a public repository: GitHub-hosted ubuntu runners, first-party
+# actions, and the Actions cache. No self-hosted runners, no paid actions.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: decision-engine git ref to verify (branch, tag or sha)
+        required: true
+        default: main
+      api-specs:
+        description: Also run the Playwright API specs (boots Postgres + Redis, ~25 min)
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/**
+      - run.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decision-engine-verify-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: short
+
+jobs:
+  verify:
+    name: Verify ${{ inputs.ref || github.ref }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the engine
+        uses: actions/checkout@v4
+        with:
+          repository: GauravPawar101/decision-engine
+          ref: ${{ inputs.ref || 'main' }}
+          path: decision-engine
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - name: Install rustfmt (the project formats with nightly)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: rustfmt
+
+      # librdkafka needs libcurl/sasl/zlib, bindgen needs libclang, the MySQL driver needs
+      # libmariadb, Postgres needs libpq. The engine's own CI installs the first four and leans on
+      # the runner image for the rest; they are listed explicitly here so this harness does not
+      # depend on the image's package set.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            zlib1g-dev \
+            libpq-dev \
+            libmariadb-dev \
+            libclang-dev \
+            cmake
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2.7.7
+        with:
+          workspaces: decision-engine
+          key: ${{ inputs.ref || 'main' }}
+
+      - name: Format
+        working-directory: decision-engine
+        run: cargo +nightly fmt --all --check
+
+      # --all-targets compiles the #[cfg(test)] modules too, so a unit test that does not type
+      # check fails here rather than in the test step below.
+      - name: Type check (postgres track, all targets)
+        working-directory: decision-engine
+        run: cargo check --all-targets --no-default-features --features postgres
+
+      - name: Type check (mysql track, all targets)
+        working-directory: decision-engine
+        run: cargo check --all-targets --features release
+
+      - name: Unit tests (postgres track)
+        working-directory: decision-engine
+        run: cargo test --no-default-features --features postgres
+
+      - name: Type check the Playwright suite
+        working-directory: decision-engine
+        run: |
+          npm ci
+          npm run typecheck
+
+  api-specs:
+    name: Playwright API specs
+    # Opt-in: boots Postgres + Redis, migrates, builds the engine, runs tests/api.
+    if: inputs.api-specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Check out the engine
+        uses: actions/checkout@v4
+        with:
+          repository: GauravPawar101/decision-engine
+          ref: ${{ inputs.ref || 'main' }}
+          path: decision-engine
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libcurl4-openssl-dev libsasl2-dev zlib1g-dev libpq-dev \
+            libmariadb-dev libclang-dev cmake postgresql-client
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2.7.7
+        with:
+          workspaces: decision-engine
+          key: ${{ inputs.ref || 'main' }}-specs
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: decision-engine/package-lock.json
+
+      - name: Install diesel CLI
+        run: cargo install diesel_cli --no-default-features --features postgres --locked
+
+      - name: Install e2e dependencies
+        working-directory: decision-engine
+        run: npm ci
+
+      - name: Build the engine
+        working-directory: decision-engine
+        run: cargo build --no-default-features --features postgres
+
+      - name: Start datastores
+        working-directory: decision-engine
+        run: |
+          COMPOSE_PROFILES= docker compose --profile postgres-ghcr \
+            up -d postgresql redis kafka kafka-init
+          COMPOSE_PROFILES= docker compose --profile postgres-ghcr \
+            up -d --wait postgresql redis kafka
+
+      - name: Apply database schema
+        working-directory: decision-engine
+        run: |
+          diesel migration run \
+            --database-url postgresql://db_user:db_pass@localhost:5432/decision_engine_db \
+            --migration-dir migrations_pg \
+            --config-file diesel_pg.toml
+
+      - name: Seed global service configs
+        working-directory: decision-engine
+        run: |
+          COMPOSE_PROFILES= docker compose --profile postgres-ghcr exec -T postgresql \
+            psql -v ON_ERROR_STOP=1 -U db_user -d decision_engine_db -c "
+              INSERT INTO service_configuration (name, value)
+              SELECT v.name, v.value
+              FROM (VALUES
+                  ('ENABLE_MERCHANT_ON_VOLUME_DISTRIBUTION_FEATURE_SR_V3', '{\"enableAll\":true,\"enableAllRollout\":100}'),
+                  ('merchants_enabled_for_score_keys_unification',         '{\"enableAll\":true,\"enableAllRollout\":100}'),
+                  ('SR_V3_INPUT_CONFIG_DEFAULT',                           '{\"defaultLatencyThreshold\":90,\"defaultBucketSize\":125,\"defaultHedgingPercent\":5}')
+              ) AS v(name, value)
+              WHERE NOT EXISTS (
+                  SELECT 1 FROM service_configuration sc WHERE sc.name = v.name
+              );"
+
+      - name: Start the engine
+        working-directory: decision-engine
+        env:
+          DECISION_ENGINE__USER_AUTH__SUPER_ADMIN_EMAILS: e2e-super-admin@juspay.com
+          DECISION_ENGINE__LOG__CONSOLE__LEVEL: WARN
+        run: |
+          nohup ./target/debug/open_router > /tmp/open_router.log 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/health >/dev/null 2>&1; then
+              echo "engine healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "engine did not become healthy in time" >&2
+          tail -100 /tmp/open_router.log >&2
+          exit 1
+
+      - name: Run the API specs
+        working-directory: decision-engine
+        env:
+          CI: 'true'
+          # The engine is already running; this also keeps Playwright from booting the dashboard.
+          PW_NO_WEBSERVER: '1'
+        run: npx playwright test --project=api
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            decision-engine/playwright-report/
+            decision-engine/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "--- engine ---"
+          tail -200 /tmp/open_router.log || true
+          echo "--- datastores ---"
+          cd decision-engine && COMPOSE_PROFILES= docker compose --profile postgres-ghcr logs --no-color | tail -200 || true
