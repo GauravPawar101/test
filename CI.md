@@ -13,9 +13,15 @@ green.
 
 | Where | What | Cost |
 | --- | --- | --- |
-| **Travis** (`rust`) | `cargo +nightly fmt --all --check`, `cargo check --all-targets` on **both** database tracks, `cargo test`, `tsc` over the Playwright suite | the heavy one |
+| **GitHub Actions** (`verify`) | `cargo +nightly fmt --all --check`, `cargo check --all-targets` on **both** database tracks, `cargo test`, `tsc` over the Playwright suite | the primary heavy lane: 4 vCPU / 16 GB runners, free for a public repo |
+| **GitHub Actions** (`light-checks`) | format + `tsc` + typos — no dependency build | ~30 s, fast signal on a PR |
+| **GitLab** (`.gitlab-ci.yml`) | the same `.ci/heavy-checks.sh` steps on shared runners | **fallback only** — for when GitHub is unavailable |
+| **Travis** (`rust`) | the same `.ci/heavy-checks.sh` steps, one per job step | 2 vCPU / 7.5 GB, which cannot link the lib test binary (OOM-killed) |
 | **Travis** (`specs`) | boot Postgres + Redis, apply the schema, build the engine, start it, run `tests/api` with Playwright | very heavy; runs on `main`, opt in elsewhere |
-| **GitHub Actions** (`light-checks`) | format + `tsc` + typos — no dependency build | ~2 min, for fast signal on a PR |
+| **Codespaces** (`.devcontainer`) | the same scripts, interactively | dev environment, not a gate |
+
+Failover: GitHub Actions first, GitLab when GitHub is down (it mirrors this repository, so it
+already holds whatever was last pushed here), Travis for the specs lane.
 
 Both database tracks are compiled because the engine ships MySQL by default and Postgres behind
 `--no-default-features --features postgres`; a change under `src/` has to hold under both.

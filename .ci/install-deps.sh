@@ -13,8 +13,13 @@ export CARGO_NET_RETRY=10
 export RUSTUP_MAX_RETRIES=10
 export PATH="$HOME/.cargo/bin:$PATH"
 
-sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
+# GitHub's and Travis's images hand you a sudoer user; GitLab's runners and the Codespace run as
+# root and have no sudo at all. Pick whichever this machine has.
+SUDO=""
+command -v sudo >/dev/null 2>&1 && SUDO="sudo"
+
+$SUDO apt-get update
+$SUDO apt-get install -y --no-install-recommends \
   pkg-config \
   libcurl4-openssl-dev \
   libsasl2-dev \

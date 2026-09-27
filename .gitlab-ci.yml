@@ -1,0 +1,59 @@
+# Fallback lane: https://gitlab.com/none-group3362339/test
+#
+# GitHub Actions (.github/workflows/verify.yml) is the primary lane; this one runs the identical
+# .ci/heavy-checks.sh steps on GitLab's shared runners, for when GitHub is unavailable. Shared
+# runners are free for a public project, and they are the same 4 vCPU / 16 GB class as GitHub's.
+#
+# The source arrives by mirroring this repository into that project
+# (Settings -> Repository -> Mirror repository, direction: pull, URL
+# https://github.com/GauravPawar101/test), so this file is already in the tree before a pipeline
+# can start. Nothing here needs a secret.
+
+stages:
+  - compile
+  - specs
+
+variables:
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  RUST_BACKTRACE: "short"
+  # Keep the cargo home inside the project so the runner's relative cache paths work.
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  GIT_DEPTH: "1"
+
+default:
+  image: ubuntu:24.04
+  interruptible: true
+
+# Keyed on the lock file, so a dependency change is the only thing that invalidates the build cache.
+cache:
+  key:
+    files: [Cargo.lock]
+    prefix: decision-engine
+  paths:
+    - .cargo/registry
+    - .cargo/git
+    - target
+
+compile:
+  stage: compile
+  script:
+    - ./.ci/install-deps.sh
+    - ./.ci/heavy-checks.sh fmt
+    - ./.ci/heavy-checks.sh check-pg
+    - ./.ci/heavy-checks.sh test-pg
+    - ./.ci/heavy-checks.sh check-mysql
+    - ./.ci/heavy-checks.sh tsc
+
+# The booted-stack lane: Postgres + Redis from the repo's compose file, schema, engine build, boot,
+# then the API specs. docker-in-docker for the datastores.
+specs:
+  stage: specs
+  only:
+    - main
+  services:
+    - docker:dind
+  script:
+    - ./.ci/install-deps.sh
+    - ./.ci/api-specs.sh
