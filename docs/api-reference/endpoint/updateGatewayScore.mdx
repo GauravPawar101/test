@@ -85,7 +85,9 @@ also carries a `gsm_info` object describing the lookup result.
   cost/volume picks, and anything a rule picked). The elimination and SR scores are never gated this
   way. When isolation is what withheld an otherwise-due SRv3 update, the engine counts it as
   `srv3_outcomes_isolated_total` (labelled by routing approach) and logs `SRV3_OUTCOME_ISOLATED`, so
-  the cost of running with isolation on is measurable instead of assumed.
+  the cost of running with isolation on is measurable instead of assumed. Only outcomes isolation
+  alone withheld are counted, so the rate reads as the cost of that flag rather than of the gate as a
+  whole.
 - A payment with no stored scoring context - it was never routed by the engine, and no context was
   saved for it - is skipped rather than rejected, and the response still reports success.
 - Do not call this after `NTW_BASED_ROUTING` just to record the selected debit network; debit audit comes from `/decide-gateway` analytics.
