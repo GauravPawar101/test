@@ -15,8 +15,14 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> start datastores"
-COMPOSE_PROFILES= docker compose --profile postgres-ghcr up -d postgresql redis
-COMPOSE_PROFILES= docker compose --profile postgres-ghcr up -d --wait postgresql redis
+# Postgres and Redis for the engine, plus the analytics stack: config/development.toml enables the
+# ClickHouse and Kafka audit pipelines, and the engine runs a startup connectivity check against
+# ClickHouse (src/bin/open_router.rs) that panics the process when it cannot reach it. The analytics
+# specs under tests/api read ClickHouse as well, so this is the same stack the engine's own CI boots.
+COMPOSE_PROFILES= docker compose --profile postgres-ghcr --profile analytics-clickhouse \
+  up -d postgresql redis kafka kafka-init clickhouse mailpit
+COMPOSE_PROFILES= docker compose --profile postgres-ghcr --profile analytics-clickhouse \
+  up -d --wait postgresql redis kafka clickhouse mailpit
 
 echo "==> apply schema"
 # Same migrations diesel would run, applied with psql so the lane does not have to compile

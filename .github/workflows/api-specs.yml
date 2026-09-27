@@ -97,4 +97,4 @@ jobs:
           echo "--- engine ---"
           tail -200 /tmp/open_router.log || true
           echo "--- datastores ---"
-          COMPOSE_PROFILES= docker compose --profile postgres-ghcr logs --no-color | tail -100 || true
+          COMPOSE_PROFILES= docker compose --profile postgres-ghcr --profile analytics-clickhouse logs --no-color | tail -100 || true
