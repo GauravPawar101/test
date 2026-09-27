@@ -23,7 +23,8 @@ permissions:
 
 concurrency:
   group: api-specs-${{ github.ref }}
-  cancel-in-progress: true
+  # A booted-stack run is ~10 minutes; superseding one to save a few is the wrong trade.
+  cancel-in-progress: false
 
 env:
   CARGO_INCREMENTAL: 0

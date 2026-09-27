@@ -54,7 +54,10 @@ export CARGO_PROFILE_DEV_DEBUG=0
 cargo build --no-default-features --features postgres
 
 echo "==> start the engine"
-DECISION_ENGINE__USER_AUTH__SUPER_ADMIN_EMAILS="e2e-super-admin@juspay.com" \
+# The super-admin roster is config-only (tests/fixtures/super-admin.ts is the single source of
+# truth for the identity, and playwright.config.ts injects the same value into the server it starts).
+# Without it the super-admin-view spec gets 403 on an authenticated request.
+DECISION_ENGINE__USER_AUTH__SUPER_ADMIN_EMAILS="superadmin@example.com" \
 DECISION_ENGINE__LOG__CONSOLE__LEVEL=WARN \
   ./target/debug/open_router > /tmp/open_router.log 2>&1 &
 ENGINE_PID=$!
