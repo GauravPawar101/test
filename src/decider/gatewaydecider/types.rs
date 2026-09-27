@@ -718,19 +718,30 @@ impl GatewayDeciderApproach {
         )
     }
 
-    /// A cost- or volume-commitment nudge: layered on SRv3, but deliberately picks a gateway the
-    /// SR head did not rank first. Both properties matter to the scoring gates, so both read this.
-    fn is_srv3_nudge(&self) -> bool {
-        matches!(
-            self,
-            Self::SrSelectionMultiObjective | Self::SrSelectionVolumeCommitment
-        )
+    /// A cost nudge: SRv3 re-picks among the PSPs it already deemed equivalent, so the pick is
+    /// still SRv3's own.
+    fn is_cost_nudge(&self) -> bool {
+        matches!(self, Self::SrSelectionMultiObjective)
     }
 
-    /// Whether the SRv3 scorer is the layer that picked the gateway — plain SRv3, its hedging and
-    /// downtime variants, and the nudges on top of it. Read by `sr_v3_producer_isolation`.
+    /// A volume-commitment nudge: the payment goes to whichever PSP owes the merchant contracted
+    /// volume, which the scorer did not pick and which is not score-equivalent to the head. It is
+    /// the strongest case of "chosen for a reason other than health", which is what makes it an
+    /// explore sample — but see `is_srv3_scored` for why it is not treated as SRv3's own pick.
+    fn is_volume_nudge(&self) -> bool {
+        matches!(self, Self::SrSelectionVolumeCommitment)
+    }
+
+    /// Whether the SRv3 scorer is the layer that picked the gateway: plain SRv3, its hedging and
+    /// downtime variants, and a cost nudge on top of them. Read by `sr_v3_producer_isolation`.
+    ///
+    /// A volume nudge is deliberately absent. It is a post-scoring step gated only on its own feature
+    /// flag, not on SRv3 being enabled, so the decider can stamp it on a decision no SR scorer made
+    /// at all; calling it SRv3-produced would repeat the mistake this whole change removes — a label
+    /// claiming a producer made a choice it did not. It is still an explore sample
+    /// ([`Self::is_explore_sample`]), which is the half that is certain and the half that matters.
     pub fn is_srv3_scored(&self) -> bool {
-        self.is_srv3_nudge()
+        self.is_cost_nudge()
             || matches!(
                 self,
                 Self::SrSelectionV3Routing
@@ -758,15 +769,17 @@ impl GatewayDeciderApproach {
     }
 
     /// Whether the payment is an off-policy ("explore") sample for the SRv3 moving window: hedging,
-    /// a nudge, or a pick no SR scorer made at all — rule-based, network-based, merchant-preference.
+    /// either nudge, or a pick no SR scorer made at all — rule-based, network-based,
+    /// merchant-preference.
     ///
-    /// The third case is why this is a variant match rather than a `"HEDGING"` substring test: every
+    /// The last case is why this is a variant match rather than a `"HEDGING"` substring test: every
     /// non-SR approach used to read as an on-policy exploit, so the explore/exploit gate dropped its
     /// outcome and discarded the gateway-health signal of any merchant mixing rules with SRv3.
     /// SRv1/v2 approaches stay on-policy: their own producer chose them.
     pub fn is_explore_sample(&self) -> bool {
         self.is_hedging()
-            || self.is_srv3_nudge()
+            || self.is_cost_nudge()
+            || self.is_volume_nudge()
             || (!self.is_srv3_scored() && !self.is_sr_scored())
     }
 }
@@ -2193,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn srv3_family_covers_plain_hedging_downtime_and_nudges() {
+    fn srv3_family_covers_plain_hedging_downtime_and_the_cost_nudge() {
         for approach in [
             GatewayDeciderApproach::SrSelectionV3Routing,
             GatewayDeciderApproach::SrV3AllDowntimeRouting,
@@ -2203,9 +2216,9 @@ mod tests {
             GatewayDeciderApproach::SrV3AllDowntimeHedging,
             GatewayDeciderApproach::SrV3DowntimeHedging,
             GatewayDeciderApproach::SrV3GlobalDowntimeHedging,
-            // Cost and volume nudges only re-pick among SRv3-equivalent gateways.
+            // A cost nudge re-picks among SRv3-equivalent gateways. A volume nudge does not:
+            // the decider can stamp it on a decision no SR scorer made, so it is not in this family.
             GatewayDeciderApproach::SrSelectionMultiObjective,
-            GatewayDeciderApproach::SrSelectionVolumeCommitment,
         ] {
             assert!(
                 approach.is_srv3_scored(),
@@ -2218,6 +2231,7 @@ mod tests {
     #[test]
     fn non_srv3_approaches_are_not_classified_as_srv3_scored() {
         for approach in [
+            GatewayDeciderApproach::SrSelectionVolumeCommitment,
             GatewayDeciderApproach::PriorityLogic,
             GatewayDeciderApproach::NtwBasedRouting,
             GatewayDeciderApproach::MerchantPreference,

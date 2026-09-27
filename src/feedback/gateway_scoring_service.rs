@@ -1508,14 +1508,22 @@ mod tests {
 
     /// (selector, isolation, explore) -> admitted.
     const ADMISSION: &[(Option<Approach>, bool, bool, bool)] = &[
-        // SRv3 hedging and the cost/volume nudges are produced by SRv3 *and* off-policy, so they
-        // clear either flag.
+        // SRv3 hedging and the cost nudge are produced by SRv3 *and* off-policy, so they clear
+        // either flag.
         (Some(Approach::SrV3Hedging), true, true, true),
         (Some(Approach::SrV3DowntimeHedging), true, true, true),
         (Some(Approach::SrSelectionMultiObjective), true, true, true),
+        // A volume nudge is off-policy but not SRv3's own pick: an isolated producer still rejects
+        // it, explore accepts it.
         (
             Some(Approach::SrSelectionVolumeCommitment),
             true,
+            true,
+            false,
+        ),
+        (
+            Some(Approach::SrSelectionVolumeCommitment),
+            false,
             true,
             true,
         ),
