@@ -755,9 +755,8 @@ pub async fn update_gateway_score(
     };
 
     //let is_pm_and_pmt_present = Fbu::isTrueString(txn_card_info.paymentMethod) && txn_card_info.paymentMethodType.is_some();
-    // Which layer picked the gateway is read from the decision's own metadata, typed rather than
-    // as free text: `PRIORITY_LOGIC` (rule-based), `MERCHANT_PREFERENCE`, `NTW_BASED_ROUTING` and
-    // `STATIC_ROUTING` are all valid answers and none of them is an SR variant.
+    // Which layer picked the gateway, read from the decision's own metadata and typed: rule-based,
+    // network and merchant-preference picks are all valid answers, and none is an SR variant.
     let decided_approach = get_typed_routing_approach(txn_detail.clone());
 
     let srv3_producer_isolation_enabled = Cutover::is_feature_enabled(
@@ -775,8 +774,8 @@ pub async fn update_gateway_score(
     )
     .await;
 
-    // The legacy dimension (elimination / outage / SR v1+v2) is written by every scoring type the
-    // transaction's own status allows, and is never gated on which layer routed the payment.
+    // The legacy dimension (elimination / outage / SR v1+v2) follows the scoring type and the
+    // transaction's status only — never which layer routed the payment.
     let should_update_gateway_score = if gateway_scoring_type.clone() == GST::PenaliseSrv3 {
         false
     } else if gateway_scoring_type.clone() == GST::Penalise {
@@ -785,21 +784,18 @@ pub async fn update_gateway_score(
         true
     };
 
-    // The SRv3 producer is driven by every scoring type except `Penalise` (the legacy "still in
-    // flight" signal) — independently of the legacy dimension above.
+    // The SRv3 producer takes every scoring type except `Penalise`, the legacy in-flight signal.
     let should_update_srv3_gateway_score = gateway_scoring_type.clone() != GST::Penalise;
 
     let redis_key = format!("{}{}", C::GATEWAY_SCORING_DATA, txn_detail.clone().txnUuid);
     let app_state = get_tenant_app_state().await;
 
-    // One read of the decision's scoring context, shared by every dimension below. It is
-    // deliberately NOT gated on the SRv3 producer/explore checks any more: which layer picked the
-    // gateway says nothing about the gateway's health, so the Redis `GatewayScoringData` is read
-    // whenever any dimension is due. Reading it here also gives the latency window and the
-    // analytics snapshot the payment's real SR metrics instead of fall-back defaults.
-    let needs_gateway_scoring_data =
-        should_update_gateway_score || should_update_srv3_gateway_score;
-    let mb_gateway_scoring_data: Option<GatewayScoringData> = if needs_gateway_scoring_data {
+    // One read of the scoring context, shared by every dimension below, and deliberately not gated
+    // on the SRv3 producer checks: which layer picked a gateway says nothing about the gateway's
+    // health. Reading it here also gives the latency window and the snapshot the payment's real SR
+    // metrics instead of fall-back defaults.
+    let any_dimension_due = should_update_gateway_score || should_update_srv3_gateway_score;
+    let mb_gateway_scoring_data: Option<GatewayScoringData> = if any_dimension_due {
         app_state
             .redis_conn
             .get_key(&redis_key, "GatewayScoringData")
@@ -862,11 +858,8 @@ pub async fn update_gateway_score(
     )
     .await;
 
-    // The SRv3 producer has two admission gates, both about estimator quality rather than about
-    // whether the outcome is worth recording at all: `sr_v3_producer_isolation` keeps the moving
-    // window to payments the SRv3 scorer itself produced, and explore/exploit keeps it to
-    // off-policy ("explore") samples. They are evaluated here, on the typed approach, and apply to
-    // the SRv3 dimension only — the legacy dimension above is never gated on the selector.
+    // The SRv3 producer's two admission gates are about estimator quality, not about whether the
+    // outcome is worth recording, so they apply to the SRv3 dimension alone.
     let should_record_srv3_post_update = srv3_producer_admits_outcome(
         decided_approach.as_ref(),
         srv3_producer_isolation_enabled,
@@ -1111,10 +1104,9 @@ pub fn get_routing_approach(txn_detail: TxnDetail) -> Option<String> {
     }
 }
 
-/// The payment's routing approach as a typed value, for every decision the feedback flow has to
-/// classify. `None` means "no usable approach recorded" — the metadata is absent, or the text is
-/// not a `GatewayDeciderApproach` variant (the rule-based layer of `/routing/hybrid` stamps its own
-/// `STATIC_ROUTING`). Callers must treat that as an unknown selector, never as a known one.
+/// The payment's routing approach as a typed value. `None` means "no usable approach recorded":
+/// the metadata is absent, or the text is not a `GatewayDeciderApproach` variant — `/routing/hybrid`'s
+/// rule layer stamps its own `STATIC_ROUTING`. Callers must read that as an unknown selector.
 pub fn get_typed_routing_approach(txn_detail: TxnDetail) -> Option<GatewayDeciderApproach> {
     get_routing_approach(txn_detail)
         .as_deref()
@@ -1129,25 +1121,16 @@ pub fn get_value_from_meta_data<T: serde::de::DeserializeOwned>(
     serde_json::from_str(metadata.peek()).ok()
 }
 
-/// Whether the SRv3 producer may accept this outcome, given the two merchant flags that constrain
-/// it. Pure, so the whole gate can be exercised without Redis or a database.
+/// Whether the SRv3 producer may accept this outcome. Pure, so the gate is testable without
+/// Redis or a database. Replaces the old `contains("V3")` / `contains("HEDGING")` substring pair
+/// with the typed classification on [`GatewayDeciderApproach`], and the two flags gate opposite
+/// things:
 ///
-/// This replaces the old `routingApproach.contains("V3")` / `contains("HEDGING")` substring pair
-/// (and the unused `contains("V2")` helper). Both are now explicit variant matches, which matters
-/// because the two flags gate *opposite* things:
-///
-///   * `srv_v3_producer_isolation` (on) restricts the producer to outcomes the SRv3 scorer itself
-///     produced. An unrecorded approach is treated as *not* SRv3-produced: the flag exists to keep
-///     foreign outcomes out of the moving window, and "we cannot tell" is not evidence of SRv3.
-///   * `explore_exploit` (on) restricts the producer to off-policy ("explore") samples, so the
-///     estimates stay unbiased. An unrecorded approach is admitted, for the mirror-image reason: an
-///     unidentifiable selector is no proof that the payment was an on-policy SRv3 exploit, and
-///     dropping it discards a real gateway-health signal.
-///
-/// Net effect: a payment routed by rules (`PRIORITY_LOGIC`), by the network, or by merchant
-/// preference is off-policy with respect to SRv3, so its outcome reaches the producer. SR-routed
-/// payments are classified exactly as before — SRv3 exploit under the isolation flag, SRv1/v2
-/// on-policy, hedging/cost/volume off-policy.
+///   * `sr_v3_producer_isolation` (on) keeps foreign outcomes out of the moving window. An
+///     unrecorded approach counts as foreign: "we cannot tell" is not evidence of SRv3.
+///   * `explore_exploit` (on) keeps on-policy samples out. An unrecorded approach counts as
+///     explore, for the mirror-image reason — an unidentifiable selector is no proof of an
+///     on-policy exploit, and dropping it discards a real gateway-health signal.
 pub fn srv3_producer_admits_outcome(
     decided_approach: Option<&GatewayDeciderApproach>,
     srv3_producer_isolation_enabled: bool,
@@ -1474,138 +1457,79 @@ mod tests {
 
     // ── Routing-approach producer/explore gates ─────────────────────────────
     //
-    // `srv3_producer_admits_outcome(approach, isolation, explore)` is the whole SRv3 admission
-    // gate. The two flags are read in `update_gateway_score`; the classification they combine is
-    // the part worth pinning down here.
+    // `srv3_producer_admits_outcome(approach, isolation, explore)` is the whole SRv3 admission gate.
+    // The two flags gate opposite things, so the table below states both columns for every kind of
+    // selector rather than one flag at a time.
     use super::srv3_producer_admits_outcome;
     use crate::decider::gatewaydecider::types::GatewayDeciderApproach as Approach;
 
-    /// Both flags on is the strictest configuration: a payment only reaches the SRv3 producer if
-    /// the SRv3 scorer produced it *and* the payment is an explore sample.
-    #[test]
-    fn both_flags_on_admits_only_srv3_explore_outcomes() {
-        assert!(srv3_producer_admits_outcome(
-            Some(&Approach::SrV3Hedging),
+    /// (selector, isolation, explore) -> admitted.
+    const ADMISSION: &[(Option<Approach>, bool, bool, bool)] = &[
+        // SRv3 hedging and the cost/volume nudges are produced by SRv3 *and* off-policy, so they
+        // clear either flag.
+        (Some(Approach::SrV3Hedging), true, true, true),
+        (Some(Approach::SrV3DowntimeHedging), true, true, true),
+        (Some(Approach::SrSelectionMultiObjective), true, true, true),
+        (
+            Some(Approach::SrSelectionVolumeCommitment),
             true,
-            true
-        ));
-        assert!(srv3_producer_admits_outcome(
-            Some(&Approach::SrSelectionMultiObjective),
             true,
-            true
-        ));
-        assert!(srv3_producer_admits_outcome(
-            Some(&Approach::SrSelectionVolumeCommitment),
             true,
-            true
-        ));
-        // Produced by SRv3 but an on-policy exploit: explore/exploit keeps it out.
-        assert!(!srv3_producer_admits_outcome(
-            Some(&Approach::SrSelectionV3Routing),
-            true,
-            true
-        ));
-    }
+        ),
+        // A plain SRv3 pick is produced by SRv3 but on-policy: isolation admits it, explore does not.
+        (Some(Approach::SrSelectionV3Routing), true, true, false),
+        (Some(Approach::SrV3DowntimeRouting), false, true, false),
+        // Foreign producers: nothing no SR scorer chose may enter an isolated producer, but as
+        // off-policy samples they are exactly what the explore gate is for. This is the fix — a
+        // rule-routed payment used to be dropped here and never moved its gateway's score.
+        (Some(Approach::PriorityLogic), true, true, false),
+        (Some(Approach::PriorityLogic), false, true, true),
+        (Some(Approach::PlDowntimeRouting), false, true, true),
+        (Some(Approach::NtwBasedRouting), false, true, true),
+        (Some(Approach::MerchantPreference), false, true, true),
+        (Some(Approach::Default), false, true, true),
+        // SRv1/v2 have their own producer, so they stay on-policy for SRv3 either way.
+        (Some(Approach::SrSelectionV2Routing), true, true, false),
+        (Some(Approach::SrSelectionV2Routing), false, true, false),
+        (Some(Approach::SrV2Hedging), false, true, true),
+    ];
 
     #[test]
-    fn both_flags_on_excludes_rule_based_and_foreign_producers() {
-        // Producer isolation holds: nothing SRv3 did not produce may enter the window.
-        for approach in [
-            Approach::PriorityLogic,
-            Approach::NtwBasedRouting,
-            Approach::MerchantPreference,
-            Approach::Default,
-            Approach::SrSelectionV2Routing,
-        ] {
-            assert!(
-                !srv3_producer_admits_outcome(Some(&approach), true, true),
-                "{} must stay out of the isolated SRv3 producer",
-                approach
+    fn srv3_producer_admission_matches_the_table() {
+        for (approach, isolation, explore, admitted) in ADMISSION {
+            assert_eq!(
+                srv3_producer_admits_outcome(approach.as_ref(), *isolation, *explore),
+                *admitted,
+                "{:?} with isolation={} explore={}",
+                approach,
+                isolation,
+                explore
             );
         }
     }
 
-    /// The regression this change exists for: with explore/exploit on (a merchant-facing toggle),
-    /// a rule-routed payment's outcome used to be classified as an on-policy exploit and dropped,
-    /// so neither its success nor its failure ever moved the gateway's score.
     #[test]
-    fn explore_flag_alone_admits_rule_routed_outcomes() {
-        for approach in [
-            Approach::PriorityLogic,
-            Approach::PlDowntimeRouting,
-            Approach::NtwBasedRouting,
-            Approach::MerchantPreference,
-            Approach::Default,
-        ] {
-            assert!(
-                srv3_producer_admits_outcome(Some(&approach), false, true),
-                "{} must be recorded as an off-policy (explore) sample",
-                approach
-            );
-        }
-        // The rule-based layer of /routing/hybrid stamps an approach that is not a variant.
-        assert!(srv3_producer_admits_outcome(None, false, true));
-    }
-
-    #[test]
-    fn explore_flag_alone_still_excludes_on_policy_srv3_exploits() {
-        // Unchanged SR behaviour: an SRv3 exploit is not an explore sample.
-        assert!(!srv3_producer_admits_outcome(
-            Some(&Approach::SrSelectionV3Routing),
-            false,
-            true
-        ));
-        assert!(!srv3_producer_admits_outcome(
-            Some(&Approach::SrV3DowntimeRouting),
-            false,
-            true
-        ));
-        // SRv1/v2 keep their existing classification too.
-        assert!(!srv3_producer_admits_outcome(
-            Some(&Approach::SrSelectionV2Routing),
-            false,
-            true
-        ));
-    }
-
-    #[test]
-    fn isolation_flag_alone_excludes_non_srv3_producers() {
-        assert!(srv3_producer_admits_outcome(
-            Some(&Approach::SrSelectionV3Routing),
-            true,
-            false
-        ));
-        assert!(srv3_producer_admits_outcome(
-            Some(&Approach::SrV3Hedging),
-            true,
-            false
-        ));
-        // Rule-based and other foreign producers stay out when isolation is on, and an unrecorded
-        // selector is not evidence of SRv3.
-        assert!(!srv3_producer_admits_outcome(
-            Some(&Approach::PriorityLogic),
-            true,
-            false
-        ));
-        assert!(!srv3_producer_admits_outcome(None, true, false));
-    }
-
-    #[test]
-    fn both_flags_off_admits_every_outcome() {
+    fn both_flags_off_admit_every_outcome() {
         // The default configuration: feedback is recorded regardless of which layer routed it.
         for approach in [
-            Approach::PriorityLogic,
-            Approach::SrSelectionV3Routing,
-            Approach::SrSelectionV2Routing,
-            Approach::MerchantPreference,
+            None,
+            Some(Approach::PriorityLogic),
+            Some(Approach::SrSelectionV3Routing),
+            Some(Approach::SrSelectionV2Routing),
         ] {
-            assert!(
-                srv3_producer_admits_outcome(Some(&approach), false, false),
-                "{} must always be recordable",
-                approach
-            );
+            assert!(srv3_producer_admits_outcome(
+                approach.as_ref(),
+                false,
+                false
+            ));
         }
-        assert!(srv3_producer_admits_outcome(None, false, false));
+    }
+
+    #[test]
+    fn an_unrecorded_selector_is_explore_but_not_srv3_produced() {
+        // /routing/hybrid's rule layer stamps its own approach, and a legacy call may record none.
+        assert!(srv3_producer_admits_outcome(None, false, true));
+        assert!(!srv3_producer_admits_outcome(None, true, true));
     }
 }
 

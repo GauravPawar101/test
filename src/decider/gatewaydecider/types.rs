@@ -718,37 +718,34 @@ impl GatewayDeciderApproach {
         )
     }
 
-    /// Whether the SRv3 scorer is the layer that picked the gateway for this payment.
-    ///
-    /// True for the plain SRv3 approaches and for every variant layered on top of them: the
-    /// hedging and downtime variants, plus the cost and volume nudges, which only re-pick among
-    /// the gateways SRv3 already deemed equivalent. This is the explicit, type-safe replacement for
-    /// matching the `routing_approach` text for a `"V3"` substring — a substring test silently
-    /// reclassifies an approach the day a new variant is added (or an existing one is renamed),
-    /// and it cannot tell `PRIORITY_LOGIC` from `SR_SELECTION_V3_ROUTING` at all.
-    ///
-    /// Consumers: the SRv3 producer admission check in `feedback::gateway_scoring_service`
-    /// (`sr_v3_producer_isolation`).
-    pub fn is_srv3_scored(&self) -> bool {
+    /// A cost- or volume-commitment nudge: layered on SRv3, but deliberately picks a gateway the
+    /// SR head did not rank first. Both properties matter to the scoring gates, so both read this.
+    fn is_srv3_nudge(&self) -> bool {
         matches!(
             self,
-            Self::SrSelectionV3Routing
-                | Self::SrV3AllDowntimeRouting
-                | Self::SrV3DowntimeRouting
-                | Self::SrV3GlobalDowntimeRouting
-                | Self::SrV3Hedging
-                | Self::SrV3AllDowntimeHedging
-                | Self::SrV3DowntimeHedging
-                | Self::SrV3GlobalDowntimeHedging
-                | Self::SrSelectionMultiObjective
-                | Self::SrSelectionVolumeCommitment
+            Self::SrSelectionMultiObjective | Self::SrSelectionVolumeCommitment
         )
     }
 
-    /// Whether the legacy success-rate scorer (SR v1 / v2) picked the gateway for this payment.
-    ///
-    /// Its own producer is separate from SRv3's, so the two families are kept apart when deciding
-    /// whether an outcome may feed a given producer.
+    /// Whether the SRv3 scorer is the layer that picked the gateway — plain SRv3, its hedging and
+    /// downtime variants, and the nudges on top of it. Read by `sr_v3_producer_isolation`.
+    pub fn is_srv3_scored(&self) -> bool {
+        self.is_srv3_nudge()
+            || matches!(
+                self,
+                Self::SrSelectionV3Routing
+                    | Self::SrV3AllDowntimeRouting
+                    | Self::SrV3DowntimeRouting
+                    | Self::SrV3GlobalDowntimeRouting
+                    | Self::SrV3Hedging
+                    | Self::SrV3AllDowntimeHedging
+                    | Self::SrV3DowntimeHedging
+                    | Self::SrV3GlobalDowntimeHedging
+            )
+    }
+
+    /// Whether the legacy success-rate scorer (SR v1 / v2) picked the gateway. A separate producer
+    /// from SRv3's, so the families are kept apart when classifying an outcome.
     pub fn is_sr_scored(&self) -> bool {
         matches!(
             self,
@@ -760,30 +757,16 @@ impl GatewayDeciderApproach {
         )
     }
 
-    /// Whether the gateway was picked *off-policy* with respect to the SRv3 scorer, i.e. the
-    /// payment is an "explore" sample for the SRv3 producer's moving window.
+    /// Whether the payment is an off-policy ("explore") sample for the SRv3 moving window: hedging,
+    /// a nudge, or a pick no SR scorer made at all — rule-based, network-based, merchant-preference.
     ///
-    /// Two kinds qualify:
-    ///   - Hedging, the classic explore path — a second gateway is sent precisely to learn about it.
-    ///   - A payment no SR scorer chose. The cost and volume nudges deliberately pick a *non-head*,
-    ///     SRv3-equivalent gateway, and rule-based, network-based and merchant-preference routing
-    ///     never consults SRv3 at all, so they are off-policy by construction.
-    ///
-    /// That second kind is why this is a variant match rather than a `"HEDGING"` substring test:
-    /// every non-SR approach (e.g. `PRIORITY_LOGIC`) used to be classified as an on-policy exploit
-    /// and its outcome was therefore dropped, silently discarding the gateway-health signal of every
-    /// merchant that mixes rules with SRv3.
-    ///
-    /// SRv1/v2 approaches stay on-policy here — their own producer is the one that chose them, and
-    /// they are classified exactly as before.
-    ///
-    /// Consumers: the explore/exploit gate in `feedback::gateway_scoring_service`.
+    /// The third case is why this is a variant match rather than a `"HEDGING"` substring test: every
+    /// non-SR approach used to read as an on-policy exploit, so the explore/exploit gate dropped its
+    /// outcome and discarded the gateway-health signal of any merchant mixing rules with SRv3.
+    /// SRv1/v2 approaches stay on-policy: their own producer chose them.
     pub fn is_explore_sample(&self) -> bool {
         self.is_hedging()
-            || matches!(
-                self,
-                Self::SrSelectionMultiObjective | Self::SrSelectionVolumeCommitment
-            )
+            || self.is_srv3_nudge()
             || (!self.is_srv3_scored() && !self.is_sr_scored())
     }
 }
@@ -791,13 +774,10 @@ impl GatewayDeciderApproach {
 impl std::str::FromStr for GatewayDeciderApproach {
     type Err = String;
 
-    /// Parses the `routing_approach` text persisted on `GatewayScoringData` (and read back by the
-    /// feedback flow) into the enum. Reuses the serde representation, so it accepts exactly what
-    /// [`fmt::Display`] writes — the two cannot drift.
-    ///
-    /// Returns an error for text that is not one of the enum's variants: the rule-based layer of
-    /// `/routing/hybrid` stamps its own `STATIC_ROUTING` approach, and older rows may carry
-    /// retired names. Callers must treat that as "unknown selector" rather than as a known one.
+    /// Parses the `routing_approach` text persisted on `GatewayScoringData` back into the enum,
+    /// through serde so it accepts exactly what [`fmt::Display`] writes and the two cannot drift.
+    /// Text that is not a variant is an error, not a guess: `/routing/hybrid`'s rule layer stamps
+    /// its own `STATIC_ROUTING`, and callers must read that as "unknown selector".
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         serde_json::from_value(AValue::String(s.trim().to_string()))
             .map_err(|e| format!("unknown routing approach {:?}: {}", s, e))
