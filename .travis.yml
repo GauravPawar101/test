@@ -33,13 +33,15 @@ env:
 jobs:
   include:
     - name: "rust: format, both DB tracks, unit tests"
-      stage: test
+      stage: compile
       script: ./.ci/heavy-checks.sh
 
     # Expensive: a full build plus a booted stack. Runs on the default branch; elsewhere set the
     # RUN_API_SPECS=true build variable (Travis → More options → Env variables) to ask for it.
+    # In its own stage so it starts after the compile lane and reuses its cargo/target cache
+    # instead of building the dependency graph a second time.
     - name: "playwright: api specs"
-      stage: test
+      stage: specs
       if: branch = main OR env(RUN_API_SPECS) = true
       script: ./.ci/api-specs.sh
 
