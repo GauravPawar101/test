@@ -860,8 +860,9 @@ pub async fn update_gateway_score(
 
     // The SRv3 producer's two admission gates are about estimator quality, not about whether the
     // outcome is worth recording, so they apply to the SRv3 dimension alone.
-    let should_record_srv3_post_update = srv3_producer_admits_outcome(
+    let should_record_srv3_post_update = srv3_write_admitted(
         decided_approach.as_ref(),
+        mb_gateway_scoring_data.is_some(),
         srv3_producer_isolation_enabled,
         explore_exploit_enabled,
     ) && should_update_srv3_gateway_score
@@ -869,13 +870,15 @@ pub async fn update_gateway_score(
 
     // Producer isolation turned a would-be SRv3 update away. That is the configured behaviour, so
     // it is counted rather than warned about: the counter is how we learn whether the trade-off is
-    // costing real merchants anything, without changing what is recorded.
+    // costing real merchants anything, without changing what is recorded. Only outcomes isolation
+    // alone would have kept are counted, so the rate reads as the cost of the flag itself.
     if should_update_srv3_gateway_score
         && is_update_within_window
-        && !should_record_srv3_post_update
         && srv3_write_isolated_from_producer(
             decided_approach.as_ref(),
+            mb_gateway_scoring_data.is_some(),
             srv3_producer_isolation_enabled,
+            explore_exploit_enabled,
         )
     {
         let approach = match decided_approach.as_ref() {
@@ -1148,21 +1151,31 @@ pub fn get_value_from_meta_data<T: serde::de::DeserializeOwned>(
     serde_json::from_str(metadata.peek()).ok()
 }
 
-/// Whether the SRv3 producer may accept this outcome. Pure, so the gate is testable without
-/// Redis or a database. Replaces the old `contains("V3")` / `contains("HEDGING")` substring pair
-/// with the typed classification on [`GatewayDeciderApproach`], and the two flags gate opposite
-/// things:
+/// Whether this feedback call may write the SRv3 moving window. Pure, so the gate is testable
+/// without Redis or a database.
+///
+/// A scoring context is a precondition, not a nicety: the producer key is derived from it, and
+/// without one `update_sr_v3_score` falls back to an empty key and creates a junk `_}queue` /
+/// `_}score` pair that every later context-less outcome then pushes into. The legacy
+/// `POST /update-score` endpoint can arrive with no context at all.
+///
+/// The rest replaces the old `contains("V3")` / `contains("HEDGING")` substring pair with the
+/// typed classification on [`GatewayDeciderApproach`]. The two flags gate opposite things:
 ///
 ///   * `sr_v3_producer_isolation` (on) keeps foreign outcomes out of the moving window. An
 ///     unrecorded approach counts as foreign: "we cannot tell" is not evidence of SRv3.
 ///   * `explore_exploit` (on) keeps on-policy samples out. An unrecorded approach counts as
 ///     explore, for the mirror-image reason — an unidentifiable selector is no proof of an
 ///     on-policy exploit, and dropping it discards a real gateway-health signal.
-pub fn srv3_producer_admits_outcome(
+pub fn srv3_write_admitted(
     decided_approach: Option<&GatewayDeciderApproach>,
+    has_scoring_context: bool,
     srv3_producer_isolation_enabled: bool,
     explore_exploit_enabled: bool,
 ) -> bool {
+    if !has_scoring_context {
+        return false;
+    }
     let is_srv3_produced = decided_approach.is_some_and(|approach| approach.is_srv3_scored());
     let is_explore = match decided_approach {
         Some(approach) => approach.is_explore_sample(),
@@ -1172,20 +1185,33 @@ pub fn srv3_producer_admits_outcome(
         && (!explore_exploit_enabled || is_explore)
 }
 
-/// Whether `sr_v3_producer_isolation` is the reason an otherwise-due SRv3 write did not happen:
-/// the payment was picked by some other layer (rules, the network, merchant preference, or a
-/// selector that was not recorded) and this merchant has isolation switched on.
+/// Whether `sr_v3_producer_isolation` is the *sole* reason an otherwise-due SRv3 write did not
+/// happen: the payment was picked by some other layer (rules, the network, merchant preference, or a
+/// selector that was not recorded), and with the flag off it would have been written.
 ///
-/// That drop is deliberate — see [`srv3_producer_admits_outcome`] — which is exactly why it needs a
+/// That drop is deliberate — see [`srv3_write_admitted`] — which is exactly why it needs a
 /// counter. Without one, "how many merchants are on the losing side of this trade-off" is a guess;
-/// with it, the answer is a rate. Never called when the SRv3 dimension was not due anyway, so the
-/// number means "outcomes that would have been recorded".
+/// with it, the answer is a rate.
+///
+/// "Sole reason" is the whole point: an outcome that some other gate would have withheld anyway is
+/// not evidence against isolation, and counting it would overstate what the flag costs. So this is
+/// derived from [`srv3_write_admitted`] with the flag forced off, rather than restating the gate's
+/// conditions, and it cannot drift away from them.
 pub fn srv3_write_isolated_from_producer(
     decided_approach: Option<&GatewayDeciderApproach>,
+    has_scoring_context: bool,
     srv3_producer_isolation_enabled: bool,
+    explore_exploit_enabled: bool,
 ) -> bool {
-    srv3_producer_isolation_enabled
-        && !decided_approach.is_some_and(|approach| approach.is_srv3_scored())
+    let would_be_written = srv3_write_admitted(
+        decided_approach,
+        has_scoring_context,
+        false,
+        explore_exploit_enabled,
+    );
+    let isolation_withheld_it = srv3_producer_isolation_enabled
+        && !decided_approach.is_some_and(|approach| approach.is_srv3_scored());
+    would_be_written && isolation_withheld_it
 }
 
 // Original Haskell function: isUpdateWithinLatencyWindow
@@ -1500,10 +1526,11 @@ mod tests {
 
     // ── Routing-approach producer/explore gates ─────────────────────────────
     //
-    // `srv3_producer_admits_outcome(approach, isolation, explore)` is the whole SRv3 admission gate.
-    // The two flags gate opposite things, so the table below states both columns for every kind of
-    // selector rather than one flag at a time.
-    use super::srv3_producer_admits_outcome;
+    // `srv3_write_admitted(approach, has_context, isolation, explore)` is the whole SRv3 admission
+    // gate. The two flags gate opposite things, so the table below states both columns for every
+    // kind of selector rather than one flag at a time; the context column is pinned separately,
+    // because every row here assumes a context exists.
+    use super::srv3_write_admitted;
     use crate::decider::gatewaydecider::types::GatewayDeciderApproach as Approach;
 
     /// (selector, isolation, explore) -> admitted.
@@ -1539,8 +1566,10 @@ mod tests {
         (Some(Approach::NtwBasedRouting), false, true, true),
         (Some(Approach::MerchantPreference), false, true, true),
         (Some(Approach::Default), false, true, true),
-        // SRv1/v2 have their own producer, so they stay on-policy for SRv3 either way.
+        // SRv1/v2 have their own producer, so they stay on-policy for SRv3 either way, and an
+        // isolated producer rejects them outright — SRv2 did not produce anything for SRv3.
         (Some(Approach::SrSelectionV2Routing), true, true, false),
+        (Some(Approach::SrSelectionV2Routing), true, false, false),
         (Some(Approach::SrSelectionV2Routing), false, true, false),
         (Some(Approach::SrV2Hedging), false, true, true),
     ];
@@ -1549,7 +1578,7 @@ mod tests {
     fn srv3_producer_admission_matches_the_table() {
         for (approach, isolation, explore, admitted) in ADMISSION {
             assert_eq!(
-                srv3_producer_admits_outcome(approach.as_ref(), *isolation, *explore),
+                srv3_write_admitted(approach.as_ref(), true, *isolation, *explore),
                 *admitted,
                 "{:?} with isolation={} explore={}",
                 approach,
@@ -1560,25 +1589,90 @@ mod tests {
     }
 
     #[test]
-    fn isolation_reports_only_what_it_excluded() {
-        // Isolation is the reason, so the predicate is true exactly for a non-SRv3 selector while the
-        // flag is on — false once the flag is off, and false for SRv3's own outcomes.
-        for (approach, isolation, isolated) in [
+    fn a_missing_scoring_context_stops_the_write() {
+        // The producer key comes from the scoring context, so a context-less call has nowhere to
+        // write: without this the SRv3 step would build an empty key and create a junk `_}queue` /
+        // `_}score` pair. The legacy /update-score endpoint reaches update_gateway_score without
+        // one, and admitting unrecorded approaches under explore would otherwise have started
+        // feeding that pair.
+        for (approach, isolation, explore) in [
+            (Some(Approach::SrV3Hedging), false, false),
+            (Some(Approach::PriorityLogic), false, true),
             (Some(Approach::PriorityLogic), true, true),
-            (Some(Approach::MerchantPreference), true, true),
-            (None, true, true),
-            (Some(Approach::PriorityLogic), false, false),
-            (Some(Approach::SrSelectionV3Routing), true, false),
-            (Some(Approach::SrV3Hedging), true, false),
+            (None, false, true),
+        ] {
+            assert!(srv3_write_admitted(
+                approach.as_ref(),
+                true,
+                isolation,
+                explore
+            ));
+            assert!(!srv3_write_admitted(
+                approach.as_ref(),
+                false,
+                isolation,
+                explore
+            ));
+        }
+    }
+
+    #[test]
+    fn isolation_reports_only_what_it_excluded() {
+        // The counter measures what the flag costs, so the predicate is true only where isolation
+        // alone withheld an outcome that every other gate would have accepted.
+        for (approach, isolation, explore, isolated) in [
+            // Isolation on, and nothing else in the way: this is the outcome the counter is for.
+            (Some(Approach::PriorityLogic), true, false, true),
+            (Some(Approach::MerchantPreference), true, false, true),
+            (Some(Approach::NtwBasedRouting), true, false, true),
+            (None, true, false, true),
+            (Some(Approach::PriorityLogic), true, true, true),
+            (Some(Approach::SrSelectionV2Routing), true, false, true),
+            // The flag is off, or SRv3 produced it, so isolation withheld nothing.
+            (Some(Approach::PriorityLogic), false, false, false),
+            (Some(Approach::PriorityLogic), false, true, false),
+            (Some(Approach::SrSelectionV3Routing), true, false, false),
+            (Some(Approach::SrV3Hedging), true, false, false),
+            (
+                Some(Approach::SrSelectionMultiObjective),
+                true,
+                false,
+                false,
+            ),
+            (Some(Approach::SrV3Hedging), true, true, false),
+            // Explore alone would have withheld this one — SRv2 is on-policy, not an explore
+            // sample — so counting it would charge isolation for a drop it did not cause.
+            (Some(Approach::SrSelectionV2Routing), true, true, false),
         ] {
             assert_eq!(
-                super::srv3_write_isolated_from_producer(approach.as_ref(), isolation),
+                super::srv3_write_isolated_from_producer(
+                    approach.as_ref(),
+                    true,
+                    isolation,
+                    explore
+                ),
                 isolated,
-                "{:?} with isolation={}",
+                "{:?} with isolation={} explore={}",
                 approach,
-                isolation
+                isolation,
+                explore
             );
         }
+    }
+
+    #[test]
+    fn a_missing_scoring_context_is_not_counted_against_isolation() {
+        // Nothing to write, so the write is not withheld by the flag — attributing it to isolation
+        // would put the legacy endpoint's traffic into the cost of the flag.
+        assert!(!super::srv3_write_isolated_from_producer(
+            Some(Approach::PriorityLogic),
+            false,
+            true,
+            false
+        ));
+        assert!(!super::srv3_write_isolated_from_producer(
+            None, false, true, true
+        ));
     }
 
     #[test]
@@ -1590,19 +1684,15 @@ mod tests {
             Some(Approach::SrSelectionV3Routing),
             Some(Approach::SrSelectionV2Routing),
         ] {
-            assert!(srv3_producer_admits_outcome(
-                approach.as_ref(),
-                false,
-                false
-            ));
+            assert!(srv3_write_admitted(approach.as_ref(), true, false, false));
         }
     }
 
     #[test]
     fn an_unrecorded_selector_is_explore_but_not_srv3_produced() {
         // /routing/hybrid's rule layer stamps its own approach, and a legacy call may record none.
-        assert!(srv3_producer_admits_outcome(None, false, true));
-        assert!(!srv3_producer_admits_outcome(None, true, true));
+        assert!(srv3_write_admitted(None, true, false, true));
+        assert!(!srv3_write_admitted(None, true, true, true));
     }
 }
 
