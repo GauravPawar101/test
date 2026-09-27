@@ -1,0 +1,100 @@
+name: api-specs
+
+# The end-to-end lane: boot Postgres + Redis, apply the schema, build the engine, start it, and run
+# the API specs (tests/api) against it.
+#
+# This runs on GitHub's runners rather than Travis's because Travis kept queueing the job and its
+# 7.5 GB VM could not link the lib test binary. The commands are the same `.ci/api-specs.sh` the
+# Travis lane and a Codespace run, so there is one definition of the lane.
+#
+# It is a separate workflow from `verify` so a slow booted-stack run cannot mask a compile failure,
+# and so a PR can take the fast lane on its own.
+#
+# The source in this repository is a copy of GauravPawar101/decision-engine; see ../CI.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: api-specs-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: short
+  DECISION_ENGINE__LOG__CONSOLE__LEVEL: WARN
+
+jobs:
+  api-specs:
+    name: Playwright API specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # librdkafka needs libcurl/sasl/zlib, bindgen needs libclang, Postgres needs libpq; the specs
+      # also shell out to psql for the migrations.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            zlib1g-dev \
+            libpq-dev \
+            libmariadb-dev \
+            libclang-dev \
+            cmake \
+            postgresql-client \
+            redis-tools
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2.7.7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install e2e dependencies
+        run: npm ci
+
+      # The api project drives the HTTP API only, but a few specs in tests/api open a page, so the
+      # browser has to be present for the whole project to run.
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the API specs
+        run: ./.ci/api-specs.sh
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "--- engine ---"
+          tail -200 /tmp/open_router.log || true
+          echo "--- datastores ---"
+          COMPOSE_PROFILES= docker compose --profile postgres-ghcr logs --no-color | tail -100 || true
