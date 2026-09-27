@@ -866,6 +866,33 @@ pub async fn update_gateway_score(
         explore_exploit_enabled,
     ) && should_update_srv3_gateway_score
         && is_update_within_window;
+
+    // Producer isolation turned a would-be SRv3 update away. That is the configured behaviour, so
+    // it is counted rather than warned about: the counter is how we learn whether the trade-off is
+    // costing real merchants anything, without changing what is recorded.
+    if should_update_srv3_gateway_score
+        && is_update_within_window
+        && !should_record_srv3_post_update
+        && srv3_write_isolated_from_producer(
+            decided_approach.as_ref(),
+            srv3_producer_isolation_enabled,
+        )
+    {
+        let approach = match decided_approach.as_ref() {
+            Some(approach) => approach.to_string(),
+            None => "UNRECORDED".to_string(),
+        };
+        crate::metrics::SRV3_OUTCOME_ISOLATED_COUNTER
+            .with_label_values(&[approach.as_str()])
+            .inc();
+        logger::info!(
+            action = "SRV3_OUTCOME_ISOLATED",
+            tag = "SRV3_OUTCOME_ISOLATED",
+            "Outcome not written to the SRv3 score: producer isolation is on and {} did not pick \
+             the gateway",
+            approach
+        );
+    }
     if !should_record_srv3_post_update {
         if let Some(metric_entry) = m_metric_entry.clone() {
             crate::analytics::DomainAnalyticsEvent::record_score_snapshot(
@@ -1143,6 +1170,22 @@ pub fn srv3_producer_admits_outcome(
     };
     (!srv3_producer_isolation_enabled || is_srv3_produced)
         && (!explore_exploit_enabled || is_explore)
+}
+
+/// Whether `sr_v3_producer_isolation` is the reason an otherwise-due SRv3 write did not happen:
+/// the payment was picked by some other layer (rules, the network, merchant preference, or a
+/// selector that was not recorded) and this merchant has isolation switched on.
+///
+/// That drop is deliberate — see [`srv3_producer_admits_outcome`] — which is exactly why it needs a
+/// counter. Without one, "how many merchants are on the losing side of this trade-off" is a guess;
+/// with it, the answer is a rate. Never called when the SRv3 dimension was not due anyway, so the
+/// number means "outcomes that would have been recorded".
+pub fn srv3_write_isolated_from_producer(
+    decided_approach: Option<&GatewayDeciderApproach>,
+    srv3_producer_isolation_enabled: bool,
+) -> bool {
+    srv3_producer_isolation_enabled
+        && !decided_approach.is_some_and(|approach| approach.is_srv3_scored())
 }
 
 // Original Haskell function: isUpdateWithinLatencyWindow
@@ -1504,6 +1547,28 @@ mod tests {
                 approach,
                 isolation,
                 explore
+            );
+        }
+    }
+
+    #[test]
+    fn isolation_reports_only_what_it_excluded() {
+        // Isolation is the reason, so the predicate is true exactly for a non-SRv3 selector while the
+        // flag is on — false once the flag is off, and false for SRv3's own outcomes.
+        for (approach, isolation, isolated) in [
+            (Some(Approach::PriorityLogic), true, true),
+            (Some(Approach::MerchantPreference), true, true),
+            (None, true, true),
+            (Some(Approach::PriorityLogic), false, false),
+            (Some(Approach::SrSelectionV3Routing), true, false),
+            (Some(Approach::SrV3Hedging), true, false),
+        ] {
+            assert_eq!(
+                super::srv3_write_isolated_from_producer(approach.as_ref(), isolation),
+                isolated,
+                "{:?} with isolation={}",
+                approach,
+                isolation
             );
         }
     }

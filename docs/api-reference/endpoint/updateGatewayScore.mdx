@@ -83,7 +83,9 @@ also carries a `gsm_info` object describing the lookup result.
   restricts the SRv3 moving window to payments the SRv3 scorer produced, and explore/exploit keeps
   on-policy SRv3 payments out of that window while still recording every off-policy one (hedging,
   cost/volume picks, and anything a rule picked). The elimination and SR scores are never gated this
-  way.
+  way. When isolation is what withheld an otherwise-due SRv3 update, the engine counts it as
+  `srv3_outcomes_isolated_total` (labelled by routing approach) and logs `SRV3_OUTCOME_ISOLATED`, so
+  the cost of running with isolation on is measurable instead of assumed.
 - A payment with no stored scoring context - it was never routed by the engine, and no context was
   saved for it - is skipped rather than rejected, and the response still reports success.
 - Do not call this after `NTW_BASED_ROUTING` just to record the selected debit network; debit audit comes from `/decide-gateway` analytics.

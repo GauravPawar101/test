@@ -147,6 +147,18 @@ pub static API_RESPONSE_COUNTER: LazyLock<CounterVec> = LazyLock::new(|| {
     )
 });
 
+/// Outcomes `/update-gateway-score` received that would have updated the SRv3 score but did not,
+/// because `sr_v3_producer_isolation` excludes payments the SRv3 scorer did not pick. Grouped by the
+/// routing approach that did pick them, so the cost of keeping that flag on is measurable rather
+/// than assumed; the drop is deliberate, so this is a volume signal and not an error rate.
+pub static SRV3_OUTCOME_ISOLATED_COUNTER: LazyLock<CounterVec> = LazyLock::new(|| {
+    CounterVec::new(
+        "srv3_outcomes_isolated_total",
+        "Outcomes excluded from the SRv3 score by producer isolation, grouped by routing approach",
+        &["routing_approach"],
+    )
+});
+
 /// `count` bucket boundaries starting at `start`, each `factor` times the previous one.
 fn exponential_buckets(start: f64, factor: f64, count: i32) -> Vec<f64> {
     (0..count).map(|i| start * factor.powi(i)).collect()
