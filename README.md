@@ -1,50 +1,234 @@
-# test — CI harness for decision-engine
+<div align="center">
 
-This repo holds no source code. It runs
-[decision-engine](https://github.com/GauravPawar101/decision-engine)'s own checks on
-GitHub's free runners, so the engine repo does not need throwaway CI and any ref can be
-verified from here.
+<img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=for-the-badge&logo=rust&logoColor=white" alt="Rust"/>
+<img src="https://img.shields.io/badge/License-AGPL%20v3-blue?style=for-the-badge" alt="License"/>
+<img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker"/>
+<img src="https://img.shields.io/github/v/release/juspay/decision-engine?include_prereleases&style=for-the-badge&label=Release&color=brightgreen" alt="Release"/>
 
-## Run it
+<br/><br/>
+
+# Decision Engine
+
+### Routing control plane for payment decisions
+
+**Open-Source • Rust • Rule-Based • Success-Rate Based**
+
+Configure routing rules, run gateway decisions, and inspect routing outcomes from APIs or the dashboard.
+
+---
+
+**[Quick Start](#quick-start)** •
+**[Documentation](#documentation)** •
+**[Architecture](#architecture)** •
+**[Contributing](#contributing)**
+
+</div>
+
+---
+
+## What is Decision Engine?
+
+Decision Engine is a Rust service that sits between your orchestrator and your list of payment gateways. When a payment comes in, it picks the best available gateway based on rules you configure — priority ordering, success-rate scoring, volume splits, or debit-network gates — and returns the decision over HTTP.
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────┐
+│  Payment    │────▶│  Decision Engine │────▶│  Best       │
+│  Request    │     │  (Fast routing)  │     │  Gateway    │
+└─────────────┘     └──────────────────┘     └─────────────┘
+```
+
+It runs as a standalone service — no vendor lock-in, no mandatory orchestrator. Your existing stack calls it over HTTP before dispatching to a gateway, and over time it improves decisions using outcome feedback you push back via the score update API.
+
+What it ships today:
+
+- **Rule-based routing** — define priority rules per merchant using Euclid, Juspay's open rule engine
+- **Success-rate ordering** — gateways ranked dynamically from transaction outcome feedback
+- **Multi-objective (cost-aware) routing** — re-ranks gateways to balance approval rate against per-gateway processing cost, favoring cheaper gateways when they don't meaningfully hurt auth
+- **Cost data ingestion** — learns each connector's real fee from settlement reports and invoices, at a fine-grained per-cluster level, to power cost-aware routing
+- **A/B testing** — split live traffic between a control and variant routing strategy with a guardrail and built-in significance testing
+- **Autopilot & auto-calibration** — background self-tuning of success-rate hedging and bucket size from observed traffic
+- **Volume splits** — distribute traffic across gateways by percentage
+- **Debit routing gates** — per-merchant toggle for debit-network routing
+- **Downtime detection** — auto-excludes gateways that are failing
+- **Analytics** — ClickHouse-backed tables for routing outcomes, decision audit, and experiment results
+- **Dashboard** — React UI for configuring rules and inspecting decisions
+- **Multi-DB** — MySQL and PostgreSQL support
+- **Team management** — invite and manage members per merchant account
+
+---
+
+## Quick Start
+
+### Docker (Recommended)
 
 ```bash
-./run.sh main                                          # verify the engine's main
-./run.sh fix/rule-based-gateway-score                  # verify a branch
-./run.sh main --api-specs                              # ... and run the Playwright API specs
+git clone https://github.com/juspay/decision-engine.git
+cd decision-engine
+docker compose --profile postgres-ghcr up -d
 ```
 
-or from the Actions tab: **Actions → decision-engine-verify → Run workflow**.
+API is ready at `http://localhost:8080`. That's it.
 
-The script prints the run URL and exits non-zero if the run fails.
+For API + dashboard + docs together:
 
-## What runs
-
-| Step | Command | Why |
-| --- | --- | --- |
-| Format | `cargo +nightly fmt --all --check` | the engine formats with nightly rustfmt |
-| Type check (postgres) | `cargo check --all-targets --no-default-features --features postgres` | the default local/dev track; `--all-targets` also compiles the unit tests |
-| Type check (mysql) | `cargo check --all-targets --features release` | the default production track; the engine's CI checks both |
-| Unit tests | `cargo test --no-default-features --features postgres` | runs the crate's `#[test]`s |
-| Spec type check | `npm ci && npm run typecheck` | `tsc --noEmit` over the Playwright suite |
-| API specs (opt-in) | `npx playwright test --project=api` | boots Postgres + Redis, migrates, builds the engine, runs `tests/api` |
-
-The API specs are opt-in because they cost ~25 minutes: they need a database, a build and a
-booted server. Add `--api-specs` (or tick the box in the workflow form) to include them.
-
-## Cost
-
-Free on a public repository: GitHub-hosted `ubuntu-latest` runners, first-party actions
-(`actions/checkout`, `actions/setup-node`, `actions/upload-artifact`), and the Actions cache.
-Third-party actions are deliberately avoided; `dtolnay/rust-toolchain` and
-`Swatinem/rust-cache` are the two exceptions, both MIT and both already used by the engine's
-own CI.
-
-Caching is keyed on the ref, so verifying a new branch pays for the dependency build once and
-reuses it after that (restored cache misses fall back to a full build).
-
-## Layout
-
+```bash
+docker compose --profile dashboard-postgres-ghcr up -d
 ```
-.github/workflows/decision-engine-verify.yml   the workflow
-run.sh                                         dispatch + wait + status
+
+Open:
+
+- API: `http://localhost:8080`
+- Dashboard: `http://localhost:8081/dashboard/`
+- Docs: `http://localhost:8081/introduction`
+- API guide (curl examples): `http://localhost:8081/api-refs/api-ref`
+- API reference (OpenAPI): `http://localhost:8081/api-reference`
+
+For deployed docs or dashboard environments, use the same paths under your deployed host, e.g. `https://<docs-host>/api-refs/api-ref`.
+
+### CockroachDB
+
+CockroachDB is PostgreSQL wire-protocol compatible, so it runs on the existing `postgres` build,
+`migrations_pg`, and `pg_database` config — no separate feature or backend. The
+`docker-compose.cockroach.yml` overlay swaps the `postgresql` service for a single-node CockroachDB.
+
+Full local dev (the `oneclick.sh` flow), with CockroachDB instead of PostgreSQL:
+
+```bash
+./oneclick.sh --cockroach
 ```
+
+The DB is published on host **26257** (CockroachDB's native port) so it coexists with a local
+PostgreSQL on 5432; `--cockroach` points the migrator, seed, and backend there automatically.
+
+Docker-only (app runs in-container against the CockroachDB service):
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.cockroach.yml --profile postgres-local up -d
+```
+
+API stays on `http://localhost:8080`; the CockroachDB DB Console is at `http://localhost:8090`. For a
+secure cluster (e.g. CockroachDB Cloud), set `pg_sslmode` (and `pg_ssl_root_cert`) under
+`[pg_database]` in your config.
+
+### From Source
+
+Prerequisites: Rust 1.85+, MySQL or PostgreSQL, Redis, [`just`](https://just.systems)
+
+```bash
+git clone https://github.com/juspay/decision-engine.git
+cd decision-engine
+
+# Edit config/development.toml with your DB, Redis, and ClickHouse connection details
+# (config/development.toml already exists with all required sections)
+```
+
+**MySQL** (default features):
+```bash
+cargo build --release --features release
+diesel migration run   # set DATABASE_URL=mysql://user:pass@host/dbname first
+RUSTFLAGS="-Awarnings" cargo run --features release
+```
+
+**PostgreSQL**:
+```bash
+cargo build --release --no-default-features --features middleware,kms-aws,postgres
+just migrate-pg        # sets DATABASE_URL from env or justfile defaults
+RUSTFLAGS="-Awarnings" cargo run --no-default-features --features postgres
+```
+
+For the full local dev environment (API + dashboard on port 5173 + docs), run:
+
+```bash
+./oneclick.sh
+```
+
+This brings up Postgres, Redis, ClickHouse, Kafka, an OpenTelemetry collector and Prometheus via Docker Compose, runs migrations, and starts the API server and dashboard locally. The API pushes its metrics to the collector on `localhost:4317`; browse them at `http://localhost:9898/metrics` or in Prometheus at `http://localhost:9090`. See [Local Setup Guide](docs/local-setup.md) for full details and options like `ONECLICK_KEEP_INFRA=1`.
+
+### Verify
+
+```bash
+curl http://localhost:8080/health
+# → {"message":"Health is good"}
+```
+
+---
+
+## Documentation
+
+| Resource | Description |
+|----------|-------------|
+| [Installation Guide](docs/installation.md) | Docker, source build, database setup — end to end |
+| [Local Setup Guide](docs/local-setup.md) | CLI, Docker, Compose profiles, and Helm |
+| [MySQL Setup Guide](docs/setup-guide-mysql.md) | MySQL-specific walkthrough |
+| [PostgreSQL Setup Guide](docs/setup-guide-postgres.md) | PostgreSQL-specific walkthrough |
+| [API Guide](docs/api-refs/api-ref.mdx) | Copy-paste `curl` examples for every route family, including cost ingestion, A/B testing, and autopilot |
+| [API Reference (Swagger)](https://juspay.github.io/decision-engine/api-docs/) | Interactive Swagger UI — browse and try every endpoint against the OpenAPI spec |
+| [Multi-Objective Routing](docs/api-refs/decide-gateway-multi-objective.mdx) | Cost-aware post-step that re-ranks gateways on expected value |
+| [Configuration Guide](docs/configuration.md) | All config options explained |
+| [Deep Dive Blog](https://juspay.io/blog/juspay-orchestrator-and-merchant-controlled-routing-engine) | How the routing logic works |
+| [Performance Benchmarks](docs/benchmarks.mdx) | Throughput and latency of the `/decide-gateway` endpoint under sustained load |
+
+---
+
+## Architecture
+
+### High-Level Flow
+
+<div align="center">
+  <img src="https://cdn.sanity.io/images/9sed75bn/production/fd872ae5b086e7a60011ad9d4d5c7988e1084d03-1999x1167.png" alt="Decision Engine Architecture" width="80%"/>
+</div>
+
+### Integration Pattern
+
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/272ad222-8a91-4bb2-aa3a-e1fc9c28e3da" alt="Integration Pattern" width="70%"/>
+</div>
+
+Decision Engine fits into an existing payment stack without replacing your orchestrator. The orchestrator calls Decision Engine to get a gateway recommendation, then dispatches to that gateway. Card data stays in your vault — Decision Engine never touches it.
+
+---
+
+## Contributing
+
+Contributions are welcome — bug reports, feature requests, docs, or code.
+
+```bash
+# Fork & clone
+git clone https://github.com/YOUR_USERNAME/decision-engine.git
+
+# Create a branch
+git checkout -b feature/your-feature
+
+# Make changes and test
+cargo test
+
+# Submit a PR
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, and check [good first issues](https://github.com/juspay/decision-engine/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) if you're new to the codebase.
+
+---
+
+## Community
+
+| Platform | Purpose |
+|----------|---------|
+| [![Slack](https://img.shields.io/badge/Slack-Join_Chat-4A154B?logo=slack)](https://join.slack.com/t/hyperswitch-io/shared_invite/zt-2jqxmpsbm-WXUENx022HjNEy~Ark7Orw) | Real-time help and discussions |
+| [GitHub Discussions](https://github.com/juspay/decision-engine/discussions) | Feature requests and ideas |
+| [GitHub Issues](https://github.com/juspay/decision-engine/issues) | Bug reports |
+
+---
+
+## License
+
+Licensed under [GNU AGPL v3.0](LICENSE).
+
+---
+
+<div align="center">
+
+Built by [Juspay](https://juspay.io)
+
+**[Back to Top](#decision-engine)**
+
+</div>

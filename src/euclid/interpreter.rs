@@ -1,0 +1,249 @@
+use crate::euclid::ast::{Output, VolumeSplit};
+use crate::euclid::utils::sample_split_winner_first;
+use crate::euclid::{ast, types};
+use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
+
+use super::ast::ConnectorInfo;
+
+pub struct InterpreterBackend {
+    _program: ast::Program,
+}
+
+impl InterpreterBackend {
+    fn eval_number_comparison_array(
+        num: u64,
+        array: &[ast::NumberComparison],
+    ) -> Result<bool, types::InterpreterError> {
+        for comparison in array {
+            let other = comparison.number;
+            let passed = match comparison.comparison_type {
+                ast::ComparisonType::GreaterThan => num > other,
+                ast::ComparisonType::LessThan => num < other,
+                ast::ComparisonType::LessThanEqual => num <= other,
+                ast::ComparisonType::GreaterThanEqual => num >= other,
+                ast::ComparisonType::Equal => num == other,
+                ast::ComparisonType::NotEqual => num != other,
+            };
+            if !passed {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn eval_comparison(
+        comparison: &ast::Comparison,
+        ctx: &types::Context,
+        globals: &ast::Globals,
+    ) -> Result<bool, types::InterpreterError> {
+        use ast::{ComparisonType::*, ValueType::*};
+
+        let (lookup_key, ctx_value) = match &comparison.value {
+            MetadataVariant(metadata) => (
+                &metadata.key,
+                ctx.get(&metadata.key)
+                    .filter(|value| value.as_ref().is_some_and(ast::ValueType::is_metadata))
+                    .or_else(|| ctx.get(&comparison.lhs)),
+            ),
+            _ => (&comparison.lhs, ctx.get(&comparison.lhs)),
+        };
+
+        if ctx_value.is_none() {
+            crate::logger::debug!(
+                missing_context_key = %lookup_key,
+                condition_lhs = %comparison.lhs,
+                "Context key not found while evaluating condition, skipping rule"
+            );
+            return Ok(false);
+        }
+
+        let value = ctx_value.and_then(|v| v.as_ref());
+
+        if let Some(val) = value {
+            match (val, &comparison.comparison, &comparison.value) {
+                (EnumVariant(e1), Equal, EnumVariant(e2)) => Ok(e1 == e2),
+                (EnumVariant(e1), NotEqual, EnumVariant(e2)) => Ok(e1 != e2),
+                (EnumVariant(e), Equal, EnumVariantArray(evec)) => Ok(evec.iter().any(|v| e == v)),
+                (EnumVariant(e), NotEqual, EnumVariantArray(evec)) => {
+                    Ok(evec.iter().all(|v| e != v))
+                }
+                (Number(n1), Equal, Number(n2)) => Ok(n1 == n2),
+                (Number(n1), NotEqual, Number(n2)) => Ok(n1 != n2),
+                (Number(n1), LessThanEqual, Number(n2)) => Ok(n1 <= n2),
+                (Number(n1), GreaterThanEqual, Number(n2)) => Ok(n1 >= n2),
+                (Number(n1), LessThan, Number(n2)) => Ok(n1 < n2),
+                (Number(n1), GreaterThan, Number(n2)) => Ok(n1 > n2),
+                (Number(n), Equal, NumberArray(nvec)) => Ok(nvec.iter().any(|v| v == n)),
+                (Number(n), NotEqual, NumberArray(nvec)) => Ok(nvec.iter().all(|v| v != n)),
+                (Number(n), Equal, NumberComparisonArray(ncvec)) => {
+                    Self::eval_number_comparison_array(*n, ncvec)
+                }
+                (MetadataVariant(m1), Equal, MetadataVariant(m2)) => Ok(m1 == m2),
+                (MetadataVariant(m1), NotEqual, MetadataVariant(m2)) => Ok(m1 != m2),
+                (StrValue(s1), Equal, StrValue(s2)) => Ok(s1 == s2),
+                (StrValue(s1), NotEqual, StrValue(s2)) => Ok(s1 != s2),
+                (val, Equal, GlobalRef(name)) => Ok(globals
+                    .get(name)
+                    .map(|set| set.contains(val))
+                    .unwrap_or(false)),
+                _ => Err(types::InterpreterError {
+                    error_type: types::InterpreterErrorType::InvalidComparison,
+                    metadata: comparison.metadata.clone(),
+                }),
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn eval_if_condition(
+        condition: &ast::IfCondition,
+        ctx: &types::Context,
+        globals: &ast::Globals,
+    ) -> Result<bool, types::InterpreterError> {
+        for comparison in condition {
+            let res = Self::eval_comparison(comparison, ctx, globals)?;
+
+            if !res {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    fn eval_if_statement(
+        stmt: &ast::IfStatement,
+        ctx: &types::Context,
+        globals: &ast::Globals,
+    ) -> Result<bool, types::InterpreterError> {
+        let cond_res = Self::eval_if_condition(&stmt.condition, ctx, globals)?;
+
+        if !cond_res {
+            return Ok(false);
+        }
+
+        if let Some(ref nested) = stmt.nested {
+            for nested_if in nested {
+                let res = Self::eval_if_statement(nested_if, ctx, globals)?;
+
+                if res {
+                    return Ok(true);
+                }
+            }
+
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    fn eval_rule_statements(
+        statements: &[ast::IfStatement],
+        ctx: &types::Context,
+        globals: &ast::Globals,
+    ) -> Result<bool, types::InterpreterError> {
+        for stmt in statements {
+            let res = Self::eval_if_statement(stmt, ctx, globals)?;
+
+            if res {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    #[inline]
+    fn eval_rule(
+        rule: &ast::Rule,
+        ctx: &types::Context,
+        globals: &ast::Globals,
+    ) -> Result<bool, types::InterpreterError> {
+        Self::eval_rule_statements(&rule.statements, ctx, globals)
+    }
+
+    pub fn eval_program(
+        program: &ast::Program,
+        ctx: &types::Context,
+    ) -> Result<types::BackendOutput, types::InterpreterError> {
+        for rule in &program.rules {
+            let res = Self::eval_rule(rule, ctx, &program.globals)?;
+
+            if res {
+                let evaluated_output =
+                    evaluate_output(&rule.output).map_err(|e| types::InterpreterError {
+                        error_type: types::InterpreterErrorType::OutputEvaluationFailed(format!(
+                            "{:?}",
+                            e
+                        )),
+                        metadata: HashMap::new(),
+                    })?;
+                return Ok(types::BackendOutput {
+                    rule_name: Some(rule.name.clone()),
+                    output: rule.output.clone(),
+                    evaluated_output,
+                });
+            }
+        }
+
+        // If no rule matched, evaluate default selection
+        let evaluated_output =
+            evaluate_output(&program.default_selection).map_err(|e| types::InterpreterError {
+                error_type: types::InterpreterErrorType::OutputEvaluationFailed(format!("{:?}", e)),
+                metadata: HashMap::new(),
+            })?;
+
+        Ok(types::BackendOutput {
+            rule_name: None,
+            output: program.default_selection.clone(),
+            evaluated_output,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub enum RoutingError {
+    VolumeSplitFailed,
+}
+
+impl fmt::Display for RoutingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VolumeSplitFailed => write!(f, "Volume split calculation failed"),
+        }
+    }
+}
+impl Error for RoutingError {}
+type RoutingResult<T> = Result<T, RoutingError>;
+
+pub fn perform_volume_split(
+    splits: Vec<VolumeSplit<ConnectorInfo>>,
+) -> RoutingResult<Vec<ConnectorInfo>> {
+    sample_split_winner_first(splits)
+}
+
+pub fn perform_volume_split_priority(
+    splits: Vec<VolumeSplit<Vec<ConnectorInfo>>>,
+) -> RoutingResult<Vec<ConnectorInfo>> {
+    Ok(sample_split_winner_first(splits)?
+        .into_iter()
+        .flatten()
+        .fold(Vec::new(), |mut ordered, connector| {
+            if !ordered.contains(&connector) {
+                ordered.push(connector);
+            }
+            ordered
+        }))
+}
+
+pub fn evaluate_output(output: &Output) -> RoutingResult<Vec<ConnectorInfo>> {
+    match output {
+        Output::Single(connector) => Ok(vec![connector.clone()]),
+        Output::Priority(connectors) => Ok(connectors.clone()),
+        Output::VolumeSplit(splits) => perform_volume_split(splits.clone()),
+        Output::VolumeSplitPriority(splits) => perform_volume_split_priority(splits.clone()),
+    }
+}

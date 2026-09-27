@@ -1,0 +1,866 @@
+use crate::redis::commands::RedisConnectionWrapper;
+use axum::http::HeaderValue;
+use axum::{
+    body::Body,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::Response,
+    routing::{delete, get, post, put},
+};
+use axum_server::{tls_rustls::RustlsConfig, Handle};
+use error_stack::ResultExt;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::OnceCell as TokioOnceCell;
+use tower::ServiceBuilder;
+use tower_http::trace as tower_trace;
+
+use crate::{
+    api_client::ApiClient,
+    config::{self, GlobalConfig, TenantConfig},
+    error, logger, middleware as custom_middleware, routes, storage,
+    tenant::GlobalAppState,
+    utils,
+};
+
+use once_cell::sync::OnceCell;
+pub static APP_STATE: OnceCell<Arc<GlobalAppState>> = OnceCell::new();
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+pub async fn get_tenant_app_state() -> Arc<TenantAppState> {
+    let app_state = APP_STATE.get().expect("GlobalAppState not set");
+    let tenant_app_state = GlobalAppState::get_app_state_of_tenant(app_state, "public")
+        .await
+        .unwrap();
+    tenant_app_state
+}
+
+type Storage = storage::Storage;
+
+async fn ensure_request_id(mut request: Request<Body>, next: Next) -> Response {
+    let header_value = request
+        .headers()
+        .get(storage::consts::X_REQUEST_ID)
+        .filter(|value| !value.as_bytes().is_empty())
+        .cloned()
+        .unwrap_or_else(generate_request_id_header_value);
+
+    request
+        .headers_mut()
+        .insert(storage::consts::X_REQUEST_ID, header_value.clone());
+
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(storage::consts::X_REQUEST_ID, header_value);
+
+    response
+}
+
+/// Counts every response to a route this service defines by route, method and status code and logs each 4xx/5xx with its request id; runs outermost so the auth layer's 401/403s are covered too.
+async fn record_api_response(request: Request<Body>, next: Next) -> Response {
+    // Only supported APIs carry a matched route; axum answers unknown paths itself, before this layer.
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str().to_owned());
+    let method = request.method().to_string();
+    let started_at = Instant::now();
+    let response = next.run(request).await;
+    if let Some(route) = route {
+        let status = response.status();
+        crate::metrics::API_RESPONSE_COUNTER
+            .with_label_values(&[route.as_str(), method.as_str(), status.as_str()])
+            .inc();
+        if status.is_client_error() || status.is_server_error() {
+            // One flat, greppable line per failure carrying the id the client received, so a count on the dashboard turns into request ids in the logs.
+            let request_id = response
+                .headers()
+                .get(storage::consts::X_REQUEST_ID)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("unknown");
+            let latency_ms = started_at.elapsed().as_millis() as u64;
+            if status.is_server_error() {
+                logger::error!(route = %route, method = %method, status_code = status.as_u16(), request_id = %request_id, latency_ms, "api_response_failed");
+            } else {
+                logger::warn!(route = %route, method = %method, status_code = status.as_u16(), request_id = %request_id, latency_ms, "api_response_failed");
+            }
+        }
+    }
+    response
+}
+
+fn generate_request_id_header_value() -> HeaderValue {
+    loop {
+        let request_id = storage::utils::generate_uuid();
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            return value;
+        }
+    }
+}
+
+fn extract_json_path(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    let nested_value = path
+        .iter()
+        .try_fold(value, |current, key| current.get(*key))?;
+
+    nested_value.as_str().map(str::to_string)
+}
+
+fn parse_request_metadata(
+    captured: &crate::analytics::CapturedBody,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let request_json = serde_json::from_slice::<serde_json::Value>(&captured.bytes).ok();
+    let merchant_id = request_json.as_ref().and_then(|value| {
+        [
+            &["merchant_id"][..],
+            &["merchantId"][..],
+            &["created_by"][..],
+            &["createdBy"][..],
+        ]
+        .into_iter()
+        .find_map(|path| extract_json_path(value, path))
+    });
+    let payment_id = request_json.as_ref().and_then(|value| {
+        [
+            &["payment_id"][..],
+            &["paymentId"][..],
+            &["payment_info", "payment_id"][..],
+            &["paymentInfo", "paymentId"][..],
+        ]
+        .into_iter()
+        .find_map(|path| extract_json_path(value, path))
+    });
+    let auth_type = request_json.as_ref().and_then(|value| {
+        [
+            &["authentication_type"][..],
+            &["authenticationType"][..],
+            &["auth_type"][..],
+            &["authType"][..],
+            &["payment_info", "authentication_type"][..],
+            &["payment_info", "auth_type"][..],
+            &["paymentInfo", "authenticationType"][..],
+            &["paymentInfo", "authType"][..],
+        ]
+        .into_iter()
+        .find_map(|path| extract_json_path(value, path))
+    });
+    (merchant_id, payment_id, auth_type)
+}
+
+fn parse_response_error(
+    status_code: u16,
+    captured: &crate::analytics::CapturedBody,
+) -> Option<serde_json::Value> {
+    if status_code < 400 {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&captured.bytes).ok()
+}
+
+async fn capture_api_event(
+    State(global_state): State<Arc<GlobalAppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if !global_state.analytics_runtime.write_enabled() {
+        return next.run(request).await;
+    }
+
+    let path = request.uri().path().to_string();
+    let Some(flow_context) = crate::analytics::classify_request(request.method(), &path) else {
+        return next.run(request).await;
+    };
+
+    let started_at = Instant::now();
+    let (parts, body) = request.into_parts();
+    let (request_body, request_handle) = crate::analytics::CaptureBody::new(body);
+
+    let request_id = parts
+        .headers
+        .get(crate::storage::consts::X_REQUEST_ID)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+    let global_request_id = crate::analytics::global_request_id_from_headers(&parts.headers);
+    let trace_id = crate::analytics::trace_id_from_headers(&parts.headers);
+    let user_agent = parts
+        .headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let ip_addr = parts
+        .headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').next().unwrap_or(value).trim().to_string())
+        .or_else(|| {
+            parts
+                .headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        });
+    let method = parts.method.to_string();
+
+    let response = next
+        .run(Request::from_parts(parts, Body::new(request_body)))
+        .await;
+    let status_code = response.status().as_u16();
+    let (response_parts, response_body) = response.into_parts();
+    let (response_body, response_handle) = crate::analytics::CaptureBody::new(response_body);
+
+    let runtime = global_state.analytics_runtime.clone();
+    tokio::spawn(async move {
+        let request_capture = request_handle.wait().await;
+        let response_capture = response_handle.wait().await;
+        let (merchant_id, payment_id, auth_type) = parse_request_metadata(&request_capture);
+        let error = parse_response_error(status_code, &response_capture);
+
+        runtime.enqueue_api_event(crate::analytics::ApiEvent {
+            event_id: crate::analytics::next_event_id(),
+            merchant_id,
+            payment_id,
+            api_flow: flow_context.api_flow,
+            flow_type: flow_context.flow_type,
+            created_at_timestamp: crate::analytics::now_ms(),
+            request_id,
+            global_request_id,
+            trace_id,
+            latency: started_at.elapsed().as_millis() as u64,
+            status_code,
+            auth_type,
+            request: String::from_utf8_lossy(&request_capture.bytes).to_string(),
+            user_agent,
+            ip_addr,
+            url_path: path,
+            response: Some(String::from_utf8_lossy(&response_capture.bytes).to_string()),
+            error,
+            http_method: method,
+        });
+    });
+
+    Response::from_parts(response_parts, Body::new(response_body))
+}
+
+///
+/// TenantAppState:
+///
+///
+/// The tenant specific appstate that is passed to main storage endpoints
+///
+#[derive(Clone)]
+pub struct TenantAppState {
+    pub db: Storage,
+    pub redis_conn: Arc<RedisConnectionWrapper>,
+    pub config: config::TenantConfig,
+    pub api_client: ApiClient,
+    pub pm_filter_graph_bundle:
+        Arc<TokioOnceCell<Arc<crate::euclid::pm_filter_graph::PmFilterGraphBundle>>>,
+}
+
+#[allow(clippy::expect_used)]
+impl TenantAppState {
+    ///
+    /// Construct new app state with configuration
+    ///
+    pub async fn new(
+        global_config: &GlobalConfig,
+        tenant_config: TenantConfig,
+        api_client: ApiClient,
+    ) -> error_stack::Result<Self, error::ConfigurationError> {
+        let db = storage::Storage::new(
+            #[cfg(feature = "mysql")]
+            &global_config.database,
+            #[cfg(feature = "postgres")]
+            &global_config.pg_database,
+            &tenant_config.tenant_secrets.schema,
+        )
+        .await
+        .change_context(error::ConfigurationError::DatabaseError)?;
+
+        let redis_conn = redis_interface::RedisConnectionPool::new(&global_config.redis)
+            .await
+            .expect("Failed to create Redis connection Pool");
+
+        Ok(Self {
+            db,
+            redis_conn: Arc::new(RedisConnectionWrapper::new(
+                redis_conn,
+                global_config.compression_filepath.clone(),
+            )),
+            api_client,
+            config: tenant_config,
+            pm_filter_graph_bundle: Arc::new(TokioOnceCell::new()),
+        })
+    }
+
+    pub async fn get_pm_filter_graph_bundle(
+        &self,
+    ) -> Option<Arc<crate::euclid::pm_filter_graph::PmFilterGraphBundle>> {
+        self.pm_filter_graph_bundle
+            .get_or_try_init(|| async {
+                let bundle = crate::euclid::pm_filter_graph::build_pm_filter_graph_bundle(
+                    &self.config.pm_filters,
+                    self.config.routing_config.as_ref(),
+                )
+                .map_err(|err| {
+                    logger::error!(
+                        tenant_id = %self.config.tenant_id,
+                        error = %err,
+                        "Failed to build pm_filters constraint graph; failing open"
+                    );
+                    err
+                })?;
+
+                logger::info!(
+                    tenant_id = %self.config.tenant_id,
+                    explicit_connector_count = bundle.explicit_connectors.len(),
+                    has_default_rules = bundle.has_default_rules,
+                    graph_node_count = bundle.node_count,
+                    graph_edge_count = bundle.edge_count,
+                    "pm_filters constraint graph built successfully"
+                );
+
+                Ok::<Arc<crate::euclid::pm_filter_graph::PmFilterGraphBundle>, String>(Arc::new(
+                    bundle,
+                ))
+            })
+            .await
+            .ok()
+            .cloned()
+    }
+}
+
+///
+/// The server responsible for the custodian APIs and main open_router APIs this will perform all storage, retrieval and
+/// deletion operation
+///
+pub async fn server_builder(
+    global_app_state: Arc<GlobalAppState>,
+) -> Result<(), error::ConfigurationError>
+where
+{
+    let socket_addr = std::net::SocketAddr::new(
+        global_app_state.global_config.server.host.parse()?,
+        global_app_state.global_config.server.port,
+    );
+
+    if APP_STATE.set(global_app_state.clone()).is_err() {
+        panic!("Failed to set global app state");
+    }
+
+    // Background job: periodically auto-calibrate SRv3 bucket size + hedging from observed
+    // traffic for merchants enrolled via the `autopilot_enabled` flag. Spawned after
+    // APP_STATE is set so config reads/writes resolve the tenant app state.
+    crate::sr_auto_calibration::spawn(
+        global_app_state.analytics_runtime.clone(),
+        global_app_state.global_config.sr_auto_calibration.clone(),
+    );
+
+    // Background job: drain the settlement-report ingest queue (download → parse → stage).
+    // No-op unless `cost_ingestion.worker_enabled` is set.
+    crate::cost_ingestion::worker::spawn(
+        global_app_state.global_config.cost_ingestion.clone(),
+        global_app_state.global_config.analytics.clickhouse.clone(),
+    );
+
+    // Background job: poll every pull-based connector's reporting API for ready reports and enqueue
+    // them. Connector-agnostic; no-op unless `report_poll_enabled`.
+    crate::cost_ingestion::poller::spawn(global_app_state.global_config.cost_ingestion.clone());
+
+    // Background job: refresh the in-house cost serving view from the fitted models, so the
+    // multi-objective router can price candidates from our own ingested data.
+    crate::cost_ingestion::serving::spawn(
+        global_app_state.global_config.analytics.clickhouse.clone(),
+    );
+
+    // Create a signal stream for SIGTERM
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to create SIGTERM handler");
+
+    // Create an axum_server handle for graceful shutdown
+    let handle = Handle::new();
+
+    // Spawn a task to listen for SIGTERM and trigger shutdown
+    let handle_clone = handle.clone();
+    tokio::spawn(async move {
+        sigterm.recv().await;
+        logger::error!("SIGTERM signal received, shutting down...");
+        let app_state = APP_STATE.get().expect("GlobalAppState not set");
+        app_state.set_not_ready(); // Set readiness flag to false
+        handle_clone.shutdown(); // Trigger axum_server shutdown
+    });
+
+    // Routes that require API key authentication
+    let protected_router = axum::Router::new()
+        .route(
+            "/routing/create",
+            axum::routing::post(crate::euclid::handlers::routing_rules::routing_create),
+        )
+        .route(
+            "/routing/activate",
+            axum::routing::post(crate::euclid::handlers::routing_rules::activate_routing_rule),
+        )
+        .route(
+            "/routing/deactivate",
+            axum::routing::post(crate::euclid::handlers::routing_rules::deactivate_routing_rule),
+        )
+        .route(
+            "/routing/update",
+            axum::routing::post(crate::euclid::handlers::routing_rules::update_routing_rule),
+        )
+        // Rule deletion is disabled for parity with the Hyperswitch dashboard, which
+        // cannot delete routing rules yet (juspay/hyperswitch-control-center#5495,
+        // item 4). Re-enable by uncommenting once both dashboards can offer it.
+        // .route(
+        //     "/routing/delete",
+        //     axum::routing::post(crate::euclid::handlers::routing_rules::delete_routing_rule),
+        // )
+        .route(
+            "/routing/list/:created_by",
+            axum::routing::post(
+                crate::euclid::handlers::routing_rules::list_all_routing_algorithm_id,
+            ),
+        )
+        .route(
+            "/routing/list/active/:created_by",
+            axum::routing::post(
+                crate::euclid::handlers::routing_rules::list_active_routing_algorithm,
+            ),
+        )
+        .route(
+            "/routing/evaluate",
+            axum::routing::post(crate::euclid::handlers::routing_rules::routing_evaluate),
+        )
+        .route(
+            "/routing/evaluate/batch",
+            axum::routing::post(crate::euclid::handlers::routing_rules::routing_evaluate_batch),
+        )
+        .route(
+            "/decision_gateway",
+            post(routes::decision_gateway::decision_gateway),
+        )
+        .route(
+            "/rule/create",
+            post(routes::rule_configuration::create_rule_config),
+        )
+        .route(
+            "/rule/get",
+            post(routes::rule_configuration::get_rule_config),
+        )
+        .route(
+            "/rule/update",
+            post(routes::rule_configuration::update_rule_config),
+        )
+        .route(
+            "/rule/delete",
+            post(routes::rule_configuration::delete_rule_config),
+        )
+        .route(
+            "/merchant-account/:merchant-id",
+            get(routes::merchant_account_config::get_merchant_config),
+        )
+        .route(
+            "/merchant-account/:merchant-id",
+            delete(routes::merchant_account_config::delete_merchant_config),
+        )
+        .route(
+            "/merchant-account/:merchant-id/debit-routing",
+            get(routes::merchant_account_config::get_debit_routing),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connectors",
+            get(routes::connector_credentials::list_connector_credentials),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connectors/:connector/credentials",
+            post(routes::connector_credentials::set_connector_credentials),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connectors/:connector/credentials/:account",
+            delete(routes::connector_credentials::delete_connector_credentials),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connectors/:connector/report",
+            // Monthly settlement reports run to several GB. The handler streams the body to disk
+            // and parses in batches (O(batch) RAM), so lift the body cap to the same hard limit it
+            // enforces itself. DefaultBodyLimit otherwise errors the stream at its default.
+            post(routes::report_upload::upload_report).layer(axum::extract::DefaultBodyLimit::max(
+                routes::report_upload::MAX_UPLOAD_BYTES,
+            )),
+        )
+        .route(
+            // Header preflight: the dashboard posts only the first few KB of the merchant's file to
+            // check it parses before committing to a multi-GB upload. Cap the body accordingly —
+            // anything larger is a client bug, and the handler stops reading at the cap anyway.
+            "/merchant-account/:merchant-id/connectors/:connector/report/validate-headers",
+            post(routes::report_upload::validate_report_headers).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    crate::cost_ingestion::preflight::HEADER_SAMPLE_BYTES,
+                ),
+            ),
+        )
+        .route(
+            // Which connectors support report ingestion, straight off the registry — the dashboard's
+            // connector picker reads this instead of keeping its own list.
+            "/cost-ingestion/connectors",
+            get(routes::report_upload::list_ingest_connectors),
+        )
+        .route(
+            // Preview a *candidate* column mapping: what the merchant's rows actually become under
+            // it. Small JSON body (a mapping + a file sample), so the default body limit applies.
+            "/merchant-account/:merchant-id/connectors/:connector/report/preview",
+            post(routes::report_upload::preview_column_mapping),
+        )
+        .route(
+            // A settlement source's saved column mapping, applied to every future ingestion of it.
+            "/merchant-account/:merchant-id/connectors/:connector/report/column-mapping",
+            get(routes::report_upload::get_column_mapping)
+                .put(routes::report_upload::set_column_mapping)
+                .delete(routes::report_upload::delete_column_mapping),
+        )
+        .route(
+            // "Use a sample file": run a curated demo report (fetched from configured URL) through
+            // the same pipeline, so a merchant without a report file can still exercise the flow.
+            "/merchant-account/:merchant-id/connectors/:connector/report/sample",
+            post(routes::report_upload::run_sample_report),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connectors/:connector/invoice",
+            // Invoices are small (a few hundred lines): buffered and processed synchronously, so the
+            // computed cost add-on is returned in the response. Cap the body to reject a settlement
+            // report accidentally uploaded here.
+            post(routes::invoice_upload::upload_invoice).layer(
+                axum::extract::DefaultBodyLimit::max(routes::invoice_upload::MAX_INVOICE_BYTES),
+            ),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connectors/:connector/invoice-addon",
+            delete(routes::invoice_upload::delete_addon),
+        )
+        .route(
+            "/merchant-account/:merchant-id/invoice-addons",
+            get(routes::invoice_upload::list_addons),
+        )
+        .route(
+            "/merchant-account/:merchant-id/invoice-reconciliation",
+            get(routes::invoice_upload::get_reconciliation),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connector-fees",
+            get(routes::connector_fees::list_connector_fees),
+        )
+        .route(
+            "/merchant-account/:merchant-id/connectors/:connector/fee-override",
+            put(routes::connector_fees::set_fee_override)
+                .delete(routes::connector_fees::delete_fee_override),
+        )
+        .route(
+            "/merchant-account/:merchant-id/cost-clusters",
+            get(routes::cost_clusters::list_cost_clusters),
+        )
+        .route(
+            "/merchant-account/:merchant-id/cost-cluster-facets",
+            get(routes::cost_clusters::list_cost_cluster_facets),
+        )
+        .route(
+            "/merchant-account/:merchant-id/cost-clusters/:cluster-key/fee-override",
+            put(routes::cost_clusters::set_cluster_override)
+                .delete(routes::cost_clusters::delete_cluster_override),
+        )
+        .route(
+            "/merchant-account/:merchant-id/seed-costs",
+            get(routes::seed_costs::get_seed_costs)
+                .put(routes::seed_costs::set_seed_costs)
+                .delete(routes::seed_costs::delete_seed_costs),
+        )
+        .route(
+            "/merchant-account/:merchant-id/seed-costs/simulate",
+            post(routes::seed_costs::simulate_seed_costs),
+        )
+        .route(
+            "/merchant-account/:merchant-id/cost-coverage",
+            get(routes::cost_coverage::get_cost_coverage),
+        )
+        .route(
+            "/merchant-account/:merchant-id/volume-commitment/dashboard",
+            get(routes::volume_commitment::get_dashboard),
+        )
+        .route(
+            "/merchant-account/:merchant-id/volume-commitment/projection",
+            get(routes::volume_commitment::get_projection),
+        )
+        .route(
+            "/merchant-account/:merchant-id/volume-commitment/impact",
+            get(routes::volume_commitment::get_impact),
+        )
+        .route(
+            "/merchant-account/:merchant-id/volume-commitment/samples",
+            get(routes::volume_commitment::get_samples),
+        )
+        // Called by the volume-commitment scheduler when a merchant's forecast comes due. Behind
+        // the same auth as any other write, and the handler narrows further: the admin secret
+        // (which the scheduler presents) may run anything, a session or api key only its own
+        // merchant, and the every-merchant sweep is admin-only.
+        .route(
+            "/volume-commitment/run-forecast",
+            post(routes::volume_commitment::run_forecast),
+        )
+        .route(
+            "/merchant-account/:merchant-id/cost-ingestions",
+            get(routes::report_upload::list_ingestions),
+        )
+        .route(
+            "/merchant-account/:merchant-id/cost-ingestions/:ingestion-id",
+            delete(routes::report_upload::delete_ingestion),
+        )
+        .route(
+            "/merchant-account/:merchant-id/cost-price-changes",
+            get(routes::report_upload::list_price_changes),
+        )
+        .route(
+            "/merchant-account/:merchant-id/debit-routing",
+            post(routes::merchant_account_config::update_debit_routing),
+        )
+        .route(
+            "/merchant-account/:merchant-id/features",
+            get(routes::merchant_account_config::get_merchant_features),
+        )
+        .route(
+            "/merchant-account/:merchant-id/features/:feature",
+            post(routes::merchant_account_config::update_merchant_feature),
+        )
+        .route(
+            "/config-sr-dimension",
+            axum::routing::post(crate::euclid::handlers::routing_rules::config_sr_dimensions),
+        )
+        .route(
+            "/config-sr-dimension/:merchant_id",
+            axum::routing::get(crate::euclid::handlers::routing_rules::get_sr_dimensions),
+        )
+        .route(
+            "/config/routing-keys",
+            axum::routing::get(crate::euclid::handlers::routing_rules::get_routing_config),
+        )
+        .route("/gsm/options", get(routes::gsm::gsm_options))
+        .route("/update-score", post(routes::update_score::update_score))
+        .route(
+            "/decide-gateway",
+            post(routes::decide_gateway::decide_gateway),
+        )
+        .route(
+            "/routing/hybrid",
+            post(routes::hybrid_routing::hybrid_routing_evaluate),
+        )
+        .route(
+            "/update-gateway-score",
+            post(routes::update_gateway_score::update_gateway_score),
+        )
+        .route(
+            "/gateway-score/reset",
+            post(routes::gateway_score::reset_gateway_scores),
+        )
+        .route("/api-key/create", post(routes::api_key::create_api_key))
+        .route(
+            "/api-key/list/:merchant_id",
+            get(routes::api_key::list_api_keys),
+        )
+        .route("/api-key/:key_id", delete(routes::api_key::revoke_api_key))
+        .nest("/analytics", routes::analytics::serve())
+        .layer(middleware::from_fn(custom_middleware::authenticate));
+
+    // Routes that do not require authentication (public)
+    let public_router = axum::Router::new()
+        .route(
+            "/merchant-account/create",
+            post(routes::merchant_account_config::create_merchant_config),
+        )
+        .route(
+            "/admin/hierarchy/reconcile",
+            post(routes::hierarchy::reconcile_hierarchy),
+        )
+        .route(
+            "/admin/hierarchy/sync",
+            post(routes::hierarchy::sync_hierarchy),
+        )
+        .route(
+            "/webhooks/settlement/:merchant_id/:connector",
+            post(routes::settlement_webhook::settlement_webhook),
+        )
+        .route("/auth/signup", post(routes::user_auth::signup))
+        .route("/auth/login", post(routes::user_auth::login))
+        .route("/auth/logout", post(routes::user_auth::logout))
+        .route("/auth/me", get(routes::user_auth::me))
+        .route("/auth/merchants", get(routes::user_auth::list_merchants))
+        .route(
+            "/auth/switch-merchant",
+            post(routes::user_auth::switch_merchant),
+        )
+        .route(
+            "/auth/super-admin/enter-merchant",
+            post(routes::user_auth::enter_merchant),
+        )
+        .route(
+            "/auth/super-admin/exit",
+            post(routes::user_auth::exit_merchant),
+        )
+        .route(
+            "/auth/super-admin/lookup",
+            post(routes::user_auth::lookup_merchants),
+        )
+        .route(
+            "/onboarding/merchant",
+            post(routes::user_auth::create_merchant),
+        )
+        .route("/merchant/members", get(routes::user_auth::list_members))
+        .route(
+            "/merchant/members/invite",
+            post(routes::user_auth::invite_member),
+        )
+        .route("/auth/verify-email", get(routes::user_auth::verify_email))
+        .route(
+            "/auth/forgot-password",
+            post(routes::user_auth::forgot_password),
+        )
+        .route(
+            "/auth/reset-password",
+            post(routes::user_auth::reset_password),
+        )
+        .route(
+            "/auth/change-password",
+            post(routes::user_auth::change_password),
+        )
+        .route(
+            "/auth/admin/merchant-token",
+            post(routes::user_auth::admin_merchant_token),
+        )
+        .route(
+            "/auth/admin/merchant-token/exchange",
+            post(routes::user_auth::exchange_merchant_token),
+        );
+
+    let router = axum::Router::new()
+        .merge(protected_router)
+        .merge(public_router);
+
+    let middleware = ServiceBuilder::new()
+        .layer(middleware::from_fn(record_api_response))
+        .layer(middleware::from_fn(ensure_request_id))
+        .layer(middleware::from_fn_with_state(
+            global_app_state.clone(),
+            capture_api_event,
+        ))
+        .layer(
+            tower_trace::TraceLayer::new_for_http()
+                .make_span_with(|request: &Request<_>| utils::record_fields_from_header(request))
+                .on_request(tower_trace::DefaultOnRequest::new().level(tracing::Level::INFO))
+                .on_response(
+                    tower_trace::DefaultOnResponse::new()
+                        .level(tracing::Level::INFO)
+                        .latency_unit(tower_http::LatencyUnit::Micros),
+                )
+                .on_failure(
+                    tower_trace::DefaultOnFailure::new()
+                        .latency_unit(tower_http::LatencyUnit::Micros)
+                        .level(tracing::Level::ERROR),
+                ),
+        );
+
+    let router = router
+        .nest("/health", routes::health::serve())
+        .layer(middleware)
+        .with_state(global_app_state.clone());
+
+    logger::info!(
+        category = "SERVER",
+        action = "main_server_startup",
+        bind_address = %socket_addr,
+        tls_enabled = global_app_state.global_config.tls.is_some(),
+        request_id_header = storage::consts::X_REQUEST_ID,
+        "Main HTTP server listening"
+    );
+
+    if let Some(tls_config) = &global_app_state.global_config.tls {
+        let tcp_listener = std::net::TcpListener::bind(socket_addr)?;
+        let rusttls_config =
+            RustlsConfig::from_pem_file(&tls_config.certificate, &tls_config.private_key).await?;
+
+        axum_server::from_tcp_rustls(tcp_listener, rusttls_config)
+            .handle(handle)
+            .serve(router.into_make_service())
+            .await?;
+    } else {
+        let tcp_listener = std::net::TcpListener::bind(socket_addr)?;
+
+        axum_server::from_tcp(tcp_listener)
+            .handle(handle) // Attach the handle for graceful shutdown
+            .serve(router.into_make_service())
+            .await?;
+    }
+
+    // Drain in-flight async feedback tasks before the runtime shuts down.
+    // close() stops new tasks from being accepted; wait() is event-driven
+    // (no polling) and resolves as soon as the last task completes.
+    let tracker = &crate::routes::update_gateway_score::FEEDBACK_TASK_TRACKER;
+    tracker.close();
+    tokio::select! {
+        _ = tracker.wait() => {
+            logger::info!("Shutdown: all feedback tasks drained cleanly");
+        }
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+            logger::warn!("Shutdown: feedback tasks still pending after 5 s drain — proceeding");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use axum::body::Bytes;
+
+    use super::parse_request_metadata;
+
+    #[test]
+    fn parse_request_metadata_supports_decide_gateway_shape() {
+        let captured = crate::analytics::CapturedBody {
+            bytes: Bytes::from_static(
+                br#"{
+                    "merchantId":"demo_merchant",
+                    "paymentInfo":{
+                        "paymentId":"pay_001",
+                        "authType":"THREE_DS"
+                    }
+                }"#,
+            ),
+        };
+
+        let (merchant_id, payment_id, auth_type) = parse_request_metadata(&captured);
+
+        assert_eq!(merchant_id.as_deref(), Some("demo_merchant"));
+        assert_eq!(payment_id.as_deref(), Some("pay_001"));
+        assert_eq!(auth_type.as_deref(), Some("THREE_DS"));
+    }
+
+    #[test]
+    fn parse_request_metadata_keeps_snake_case_support() {
+        let captured = crate::analytics::CapturedBody {
+            bytes: Bytes::from_static(
+                br#"{
+                    "merchant_id":"demo_merchant",
+                    "payment_id":"pay_002",
+                    "authentication_type":"NO_THREE_DS"
+                }"#,
+            ),
+        };
+
+        let (merchant_id, payment_id, auth_type) = parse_request_metadata(&captured);
+
+        assert_eq!(merchant_id.as_deref(), Some("demo_merchant"));
+        assert_eq!(payment_id.as_deref(), Some("pay_002"));
+        assert_eq!(auth_type.as_deref(), Some("NO_THREE_DS"));
+    }
+}

@@ -1,0 +1,47 @@
+# Heavy CI lane for decision-engine.
+#
+# This repository carries the engine's source so Travis can build it directly (Travis only builds
+# the repository a .travis.yml lives in). When the engine's fork has moved on, re-sync the source
+# here — see ../CI.md.
+#
+# Two lanes, because the second is expensive:
+#   * rust   — format, type check both database tracks, unit tests, Playwright type check
+#   * specs  — boot Postgres + Redis, migrate, build, start the engine, run tests/api
+#
+# GitHub Actions keeps a light lane (format + type check only, ~2 min) for fast signal; every
+# compile and every spec run happens here.
+
+language: minimal
+os: linux
+dist: jammy
+
+cache:
+  cargo: true
+  directories:
+    - $HOME/.cargo/registry
+    - $HOME/.cargo/git
+    - target
+
+env:
+  global:
+    - CARGO_INCREMENTAL=0
+    - CARGO_NET_RETRY=10
+    - RUSTUP_MAX_RETRIES=10
+    - RUST_BACKTRACE=short
+    - PATH=$HOME/.cargo/bin:$PATH
+
+jobs:
+  include:
+    - name: "rust: format, both DB tracks, unit tests"
+      stage: test
+      script: ./.ci/heavy-checks.sh
+
+    # Expensive: a full build plus a booted stack. Runs on the default branch; elsewhere set the
+    # RUN_API_SPECS=true build variable (Travis → More options → Env variables) to ask for it.
+    - name: "playwright: api specs"
+      stage: test
+      if: branch = main OR env(RUN_API_SPECS) = true
+      script: ./.ci/api-specs.sh
+
+before_install:
+  - ./.ci/install-deps.sh

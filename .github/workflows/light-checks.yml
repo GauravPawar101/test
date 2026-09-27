@@ -1,0 +1,55 @@
+name: light-checks
+
+# The fast lane: format and type checks only, no compilation of the dependency graph.
+#
+# Every compile, every unit test run and every spec run is Travis's job (see .travis.yml) — the
+# engine's ~700-dependency build is far too heavy to duplicate here. What stays on GitHub Actions
+# is what a PR should not be able to break silently: formatting, and the TypeScript in the spec
+# suite.
+#
+# The source in this repository is a copy of GauravPawar101/decision-engine; see ../CI.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: light-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  light:
+    name: Format and type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rustfmt (the engine formats with nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo +nightly fmt --all --check
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Type check the Playwright suite
+        run: |
+          npm ci
+          npm run typecheck
+
+      - name: Spell check
+        uses: crate-ci/typos@v1
