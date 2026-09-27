@@ -41,6 +41,10 @@ WHERE NOT EXISTS (
 SQL
 
 echo "==> build the engine"
+# No debug info: this build exists to be booted and poked by the specs, and dropping debuginfo is
+# what keeps a full codegen of the ~700-dependency graph inside a 7.5 GB runner (it is also what
+# the compile lane does for the test link).
+export CARGO_PROFILE_DEV_DEBUG=0
 cargo build --no-default-features --features postgres
 
 echo "==> start the engine"

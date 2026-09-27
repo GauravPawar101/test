@@ -32,9 +32,23 @@ env:
 
 jobs:
   include:
-    - name: "rust: format, both DB tracks, unit tests"
+    # One `script` entry per check: a failure then names itself, and a runner that OOM-kills the
+    # test link does not hide the fact that the checks before it passed.
+    - name: "rust: format"
       stage: compile
-      script: ./.ci/heavy-checks.sh
+      script: ./.ci/heavy-checks.sh fmt
+    - name: "rust: type check postgres track"
+      stage: compile
+      script: ./.ci/heavy-checks.sh check-pg
+    - name: "rust: unit tests postgres track"
+      stage: compile
+      script: ./.ci/heavy-checks.sh test-pg
+    - name: "rust: type check mysql track"
+      stage: compile
+      script: ./.ci/heavy-checks.sh check-mysql
+    - name: "playwright: suite type check"
+      stage: compile
+      script: ./.ci/heavy-checks.sh tsc
 
     # Expensive: a full build plus a booted stack. Runs on the default branch; elsewhere set the
     # RUN_API_SPECS=true build variable (Travis → More options → Env variables) to ask for it.
