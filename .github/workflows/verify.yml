@@ -1,0 +1,84 @@
+name: verify
+
+# The heavy compile lane, on GitHub's own runners: format, type check both database tracks, run the
+# unit tests, type check the Playwright suite.
+#
+# It runs the same `.ci/heavy-checks.sh` steps as the Travis lane, one source of truth for what a
+# check *is*. The reason it exists separately: GitHub's ubuntu runners have 4 vCPU and 16 GB, where
+# Travis's VM has 2 and 7.5 GB, and linking this project's lib test binary does not fit in 7.5 GB
+# (Travis's compile lane was OOM-killed at that link). The API specs still run on Travis, which
+# needs no debug info either way.
+#
+# The source in this repository is a copy of GauravPawar101/decision-engine; see ../CI.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: short
+
+jobs:
+  verify:
+    name: Format, both DB tracks, unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install rustfmt (the project formats with nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
+      # librdkafka needs libcurl/sasl/zlib, bindgen needs libclang, the MySQL driver needs
+      # libmariadb, Postgres needs libpq.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libcurl4-openssl-dev \
+            libsasl2-dev \
+            zlib1g-dev \
+            libpq-dev \
+            libmariadb-dev \
+            libclang-dev \
+            cmake
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2.7.7
+
+      - name: Format
+        run: ./.ci/heavy-checks.sh fmt
+
+      - name: Type check (postgres track, all targets)
+        run: ./.ci/heavy-checks.sh check-pg
+
+      - name: Unit tests (postgres track)
+        run: ./.ci/heavy-checks.sh test-pg
+
+      - name: Type check (mysql track, all targets)
+        run: ./.ci/heavy-checks.sh check-mysql
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Type check the Playwright suite
+        run: ./.ci/heavy-checks.sh tsc
