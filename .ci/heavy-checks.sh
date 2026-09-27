@@ -57,13 +57,15 @@ run_tsc() {
 }
 
 steps_for() {
-  case "$1" in
-    all) echo "fmt check-pg test-pg check-mysql tsc" ;;
-    "") echo "fmt check-pg test-pg check-mysql tsc" ;;
-    fmt | check-pg | test-pg | check-mysql | tsc) echo "$1" ;;
+  case "${1:-all}" in
+    all | "") echo "fmt check_pg test_pg check_mysql tsc" ;;
+    fmt | check_pg | test_pg | check_mysql | tsc) echo "$1" ;;
+    # The hyphenated spelling reads better in a workflow file, so accept it — but the functions
+    # are named with underscores, and `run_check-pg` is not a command bash can call.
+    check-pg | test-pg | check-mysql) echo "${1//-/_}" ;;
     *)
       echo "unknown step: $1 (expected one of: fmt check-pg test-pg check-mysql tsc, or all)" >&2
-      exit 2
+      return 2
       ;;
   esac
 }

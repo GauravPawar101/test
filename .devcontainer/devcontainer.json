@@ -1,0 +1,54 @@
+{
+  // A dev container for building the engine without a workstation that can.
+  //
+  // The dependency graph is ~700 crates and linking the lib test binary needs more memory than a
+  // laptop should spend on it. A Codespace gives 4 vCPU / 16 GB, which is enough, and it comes
+  // with the native libraries the build needs already wired up: this project cannot even be
+  // `cargo check`ed on a plain machine that lacks the MySQL client headers and libclang.
+  //
+  // Open this repository in a Codespace, then:
+  //   ./.ci/install-deps.sh          native packages + pinned toolchains (also the CI script)
+  //   ./.ci/heavy-checks.sh          fmt, both DB tracks, unit tests, tsc
+  //   ./.ci/api-specs.sh             Postgres + Redis, engine build, boot, Playwright API specs
+  //
+  // The same scripts run in CI, so what passes here is what CI runs.
+  "name": "decision-engine (CI mirror)",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+
+  "features": {
+    // Rust with rustfmt on stable and nightly; the project formats with nightly rustfmt.
+    "ghcr.io/devcontainers/features/rust:1": {
+      "toolchain": "stable",
+      "components": "rustfmt, clippy",
+      "rustupToolchains": ["stable", "nightly"]
+    },
+    "ghcr.io/devcontainers/features/node:1": { "version": "20" },
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "onCreateCommand": ".ci/install-deps.sh",
+  "postCreateCommand": "npm ci && rustup component add rustfmt --toolchain nightly",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml",
+        "ms-azuretools.vscode-docker"
+      ],
+      "settings": {
+        // The crate is large; give rust-analyzer a check job that matches how CI builds it.
+        "rust-analyzer.cargo.allTargets": true,
+        "rust-analyzer.cargo.features": "postgres",
+        "rust-analyzer.cargo.buildScripts.enable": true,
+        "files.watcherExclude": {
+          "**/target": true,
+          "**/node_modules": true
+        }
+      }
+    }
+  },
+
+  "remoteUser": "codespace"
+}
