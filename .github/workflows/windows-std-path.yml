@@ -1,0 +1,67 @@
+name: Windows std path consistency check
+# Scoped bootstrap job on windows-latest: builds stage-1 std, then runs the std
+# integration tests filtered to the partially-consumed-prefix consistency test.
+# Conventions (permissions, bash shell, concurrency) mirror rust-lang/rust
+# .github/workflows/ci.yml.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Same rationale as rust's ci.yml: identical step behavior on every host.
+    shell: bash
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Test name inside library/std/tests/path.rs this run must exercise.
+  TEST_FILTER: test_eq_ord_consistency_partially_consumed_prefix
+
+jobs:
+  std-path-windows:
+    name: x.py test library/std (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout the source code
+        uses: actions/checkout@v4
+        with:
+          # Shallow, same as rust's ci.yml jobs; actions aren't persisted.
+          persist-credentials: false
+
+      - name: Verify bootstrap can see a git work tree
+        run: git rev-parse --is-inside-work-tree
+
+      - name: Write bootstrap.toml
+        run: |
+          cat > bootstrap.toml <<'EOF'
+          change-id = "ignore"
+          profile = "library"
+          [llvm]
+          download-ci-llvm = true
+          EOF
+          cat bootstrap.toml
+
+      - name: Bootstrap cache (stage0 + CI LLVM download)
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/download
+            build/x86_64-pc-windows-msvc/llvm
+          key: wi-std-${{ runner.os }}-${{ github.sender.login }}-${{ github.ref_name }}
+
+      - name: Stage 1 std build and targeted path test (windows-latest)
+        run: |
+          python x.py test library/std --tests --test-args "$TEST_FILTER"
+
+      - name: Cross-target check: std for windows-msvc (cfg-level guard)
+        if: success()
+        run: |
+          python x.py check library/std --target x86_64-pc-windows-msvc
