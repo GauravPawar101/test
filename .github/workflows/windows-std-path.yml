@@ -55,13 +55,13 @@ jobs:
           path: |
             build/download
             build/x86_64-pc-windows-msvc/llvm
-          key: wi-std-${{ runner.os }}-${{ github.sender.login }}-${{ github.ref_name }}
+          key: wi-std-${{ runner.os }}-${{ github.ref_name }}
 
       - name: Stage 1 std build and targeted path test (windows-latest)
         run: |
           python x.py test library/std --tests --test-args "$TEST_FILTER"
 
-      - name: Cross-target check: std for windows-msvc (cfg-level guard)
+      - name: "Cross-target check: std for windows-msvc (cfg-level guard)"
         if: success()
         run: |
           python x.py check library/std --target x86_64-pc-windows-msvc
