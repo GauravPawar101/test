@@ -1,8 +1,12 @@
-name: Windows std path consistency check
-# Scoped bootstrap job on windows-latest: builds stage-1 std, then runs the std
-# integration tests filtered to the partially-consumed-prefix consistency test.
-# Conventions (permissions, bash shell, concurrency) mirror rust-lang/rust
-# .github/workflows/ci.yml.
+name: Windows path consistency test (nightly scratch crate, pre-fix std)
+# Deliberately contains NO source fix: this branch only carries the regression
+# test. The test is compiled into a throwaway crate and run against the
+# INSTALLED nightly std of the runner, which still has the pre-fix
+# Components::eq fast path. The job is expected to FAIL at
+# assert_ne!(drive, unc) - that failure is the observation of the original
+# bug on Windows. Requires nightly because the test file uses
+# #![feature(...)] gates (clone_to_uninit, normalize_lexically,
+# path_trailing_sep).
 
 on:
   push:
@@ -21,49 +25,26 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Test name inside library/std/tests/path.rs this run must exercise.
-  TEST_FILTER: test_eq_ord_consistency_partially_consumed_prefix
-
 jobs:
-  std-path-windows:
-    name: x.py test library/std (windows-latest)
+  scratch-nightly:
+    name: cargo test path against installed nightly (windows-latest; expected FAIL pre-fix)
     runs-on: windows-latest
     steps:
       - name: Checkout the source code
         uses: actions/checkout@v4
         with:
-          # Shallow, same as rust's ci.yml jobs; actions aren't persisted.
           persist-credentials: false
 
-      - name: Verify bootstrap can see a git work tree
-        run: git rev-parse --is-inside-work-tree
+      - name: Install nightly toolchain (minimal profile)
+        run: rustup toolchain install nightly --profile minimal
 
-      - name: Write bootstrap.toml
+      - name: Create scratch crate with the std path test suite
         run: |
-          cat > bootstrap.toml <<'EOF'
-          change-id = "ignore"
-          profile = "library"
-          [llvm]
-          download-ci-llvm = true
-          EOF
-          cat bootstrap.toml
+          cargo new scratch --lib
+          mkdir -p scratch/tests
+          cp library/std/tests/path.rs scratch/tests/path.rs
+          grep -n "test_eq_ord_consistency_partially_consumed_prefix" scratch/tests/path.rs
 
-      - name: Bootstrap cache (stage0 + CI LLVM download)
-        uses: actions/cache@v4
-        with:
-          path: |
-            build/download
-            build/x86_64-pc-windows-msvc/llvm
-          key: wi-std-${{ runner.os }}-${{ github.ref_name }}
-
-      - name: Stage 1 std build and targeted path test (windows-latest)
-        # Explicit --stage 1: bootstrap refuses an *implicit* stage under CI
-        # (config.rs assertion), and stage 1 keeps this to an std-only build.
-        run: |
-          python x.py test library/std --stage 1 --tests --test-args "$TEST_FILTER"
-
-      - name: "Cross-target check: std for windows-msvc (cfg-level guard)"
-        if: success()
-        run: |
-          python x.py check library/std --target x86_64-pc-windows-msvc
+      - name: Run path tests against installed pre-fix std
+        working-directory: scratch
+        run: cargo +nightly test --test path
