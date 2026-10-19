@@ -126,7 +126,7 @@ fn test_eq_ord_consistency_partially_consumed_prefix() {
     assert!(matches!(unc.next(), Some(Component::Prefix(_))));
 
     assert_ne!(drive, unc);
-    assert_eq!(drive.cmp(&unc), Ordering::Less);
+    assert_eq!(Ord::cmp(&drive, &unc), Ordering::Less);
 }
 
 #[test]
