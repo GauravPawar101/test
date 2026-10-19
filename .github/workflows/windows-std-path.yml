@@ -1,8 +1,10 @@
-name: Windows std path consistency check
-# Scoped bootstrap job on windows-latest: builds stage-1 std, then runs the std
-# integration tests filtered to the partially-consumed-prefix consistency test.
-# Conventions (permissions, bash shell, concurrency) mirror rust-lang/rust
-# .github/workflows/ci.yml.
+name: Windows path consistency test (nightly build-std)
+# Identical on every branch by design: the ONLY difference between branches is
+# library/std/src/path.rs (fix present vs absent). The branch's std path module
+# is overlaid onto the nightly toolchain's rust-src tree, a scratch crate is
+# created around the branch's std path test suite, and cargo -Zbuild-std
+# compiles std FROM THAT SOURCE and runs the tests against it.
+# Expected: fix branch green; test-only branch red at assert_ne!(drive, unc).
 
 on:
   push:
@@ -21,52 +23,34 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Test name inside library/std/tests/path.rs this run must exercise.
-  TEST_FILTER: test_eq_ord_consistency_partially_consumed_prefix
-
 jobs:
-  std-path-windows:
-    name: x.py test library/std (windows-latest)
+  build-std-path-test:
+    name: build-std path tests (windows-latest, branch std source)
     runs-on: windows-latest
     steps:
       - name: Checkout the source code
         uses: actions/checkout@v4
         with:
-          # Shallow, same as rust's ci.yml jobs; actions aren't persisted.
           persist-credentials: false
 
-      - name: Verify bootstrap can see a git work tree
-        run: git rev-parse --is-inside-work-tree
+      - name: Install nightly toolchain with rust-src
+        run: rustup toolchain install nightly --profile minimal --component rust-src
 
-      - name: Write bootstrap.toml
+      - name: Overlay branch std path module onto nightly rust-src
         run: |
-          cat > bootstrap.toml <<'EOF'
-          change-id = "ignore"
-          profile = "library"
-          [llvm]
-          download-ci-llvm = true
-          EOF
-          cat bootstrap.toml
+          SRC="$(rustc +nightly --print sysroot)/lib/rustlib/src/rust/library"
+          test -f "$SRC/std/src/path.rs"
+          cp library/std/src/path.rs "$SRC/std/src/path.rs"
+          cmp library/std/src/path.rs "$SRC/std/src/path.rs"
+          echo "overlay applied to: $SRC/std/src/path.rs"
 
-      - name: Bootstrap cache (stage0 + CI LLVM download)
-        uses: actions/cache@v4
-        with:
-          path: |
-            build/download
-            build/x86_64-pc-windows-msvc/llvm
-          key: wi-std-${{ runner.os }}-${{ github.ref_name }}
-
-      - name: Stage 1 std build and targeted path test (windows-latest)
-        # Explicit --stage 1: bootstrap refuses an *implicit* stage under CI
-        # (config.rs assertion). No --tests: that flag selects the generic
-        # `Crate` step (test.rs:3615), which assembles the full stage1
-        # compiler and pulls in LLVM; the default `Std` step only builds
-        # std + rustdoc + lld-wrapper.
+      - name: Create scratch crate with the branch path test suite
         run: |
-          python x.py test library/std --stage 1 --test-args "$TEST_FILTER"
+          cargo new scratch --lib
+          mkdir -p scratch/tests
+          cp library/std/tests/path.rs scratch/tests/path.rs
+          grep -n "test_eq_ord_consistency_partially_consumed_prefix" scratch/tests/path.rs
 
-      - name: "Cross-target check: std for windows-msvc (cfg-level guard)"
-        if: success()
-        run: |
-          python x.py check library/std --target x86_64-pc-windows-msvc
+      - name: Build std from branch source and run path tests (windows-msvc)
+        working-directory: scratch
+        run: cargo +nightly test -Zbuild-std --target x86_64-pc-windows-msvc --test path
