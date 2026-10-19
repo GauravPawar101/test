@@ -1,12 +1,10 @@
-name: Windows path consistency test (nightly scratch crate, pre-fix std)
-# Deliberately contains NO source fix: this branch only carries the regression
-# test. The test is compiled into a throwaway crate and run against the
-# INSTALLED nightly std of the runner, which still has the pre-fix
-# Components::eq fast path. The job is expected to FAIL at
-# assert_ne!(drive, unc) - that failure is the observation of the original
-# bug on Windows. Requires nightly because the test file uses
-# #![feature(...)] gates (clone_to_uninit, normalize_lexically,
-# path_trailing_sep).
+name: Windows path consistency test (nightly build-std)
+# Identical on every branch by design: the ONLY difference between branches is
+# library/std/src/path.rs (fix present vs absent). The branch's std path module
+# is overlaid onto the nightly toolchain's rust-src tree, a scratch crate is
+# created around the branch's std path test suite, and cargo -Zbuild-std
+# compiles std FROM THAT SOURCE and runs the tests against it.
+# Expected: fix branch green; test-only branch red at assert_ne!(drive, unc).
 
 on:
   push:
@@ -26,8 +24,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  scratch-nightly:
-    name: cargo test path against installed nightly (windows-latest; expected FAIL pre-fix)
+  build-std-path-test:
+    name: build-std path tests (windows-latest, branch std source)
     runs-on: windows-latest
     steps:
       - name: Checkout the source code
@@ -35,16 +33,24 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install nightly toolchain (minimal profile)
-        run: rustup toolchain install nightly --profile minimal
+      - name: Install nightly toolchain with rust-src
+        run: rustup toolchain install nightly --profile minimal --component rust-src
 
-      - name: Create scratch crate with the std path test suite
+      - name: Overlay branch std path module onto nightly rust-src
+        run: |
+          SRC="$(rustc +nightly --print sysroot)/lib/rustlib/src/rust/library"
+          test -f "$SRC/std/src/path.rs"
+          cp library/std/src/path.rs "$SRC/std/src/path.rs"
+          cmp library/std/src/path.rs "$SRC/std/src/path.rs"
+          echo "overlay applied to: $SRC/std/src/path.rs"
+
+      - name: Create scratch crate with the branch path test suite
         run: |
           cargo new scratch --lib
           mkdir -p scratch/tests
           cp library/std/tests/path.rs scratch/tests/path.rs
           grep -n "test_eq_ord_consistency_partially_consumed_prefix" scratch/tests/path.rs
 
-      - name: Run path tests against installed pre-fix std
+      - name: Build std from branch source and run path tests (windows-msvc)
         working-directory: scratch
-        run: cargo +nightly test --test path
+        run: cargo +nightly test -Zbuild-std --target x86_64-pc-windows-msvc --test path
