@@ -59,9 +59,12 @@ jobs:
 
       - name: Stage 1 std build and targeted path test (windows-latest)
         # Explicit --stage 1: bootstrap refuses an *implicit* stage under CI
-        # (config.rs assertion), and stage 1 keeps this to an std-only build.
+        # (config.rs assertion). No --tests: that flag selects the generic
+        # `Crate` step (test.rs:3615), which assembles the full stage1
+        # compiler and pulls in LLVM; the default `Std` step only builds
+        # std + rustdoc + lld-wrapper.
         run: |
-          python x.py test library/std --stage 1 --tests --test-args "$TEST_FILTER"
+          python x.py test library/std --stage 1 --test-args "$TEST_FILTER"
 
       - name: "Cross-target check: std for windows-msvc (cfg-level guard)"
         if: success()
